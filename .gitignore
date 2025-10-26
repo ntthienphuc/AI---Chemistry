@@ -1,0 +1,6 @@
+/Spike_test_AI
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+/weights

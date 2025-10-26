@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+ultralytics
+opencv-python
+numpy
+pandas
+scikit-learn
+albumentations
+torch
+torchvision
+timm
+tqdm
+python-multipart
