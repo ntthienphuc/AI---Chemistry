@@ -49,6 +49,8 @@ The same flow powers both the CLI (`python -m ai_chemistry.inference.pipeline`) 
 
 Each `.pt` is paired with a `.meta.json` storing class order, ppm scaling, and image size, enabling the inference module to rebuild the architecture automatically.
 
+> **Weights download**: Grab the complete folder from https://drive.google.com/drive/folders/1yDxk7LtQoWzoArY87GYdXD_7xoKB0DlR?usp=sharing and drop everything into the repository’s `weights/` directory. The archive already contains the four classifier checkpoints plus `best.pt`; keep the filenames unchanged so the API can auto-discover them.
+
 ---
 
 ### Environment Setup
@@ -121,6 +123,64 @@ Use `--help` for options covering learning rate, warmup epochs, EMA decay, gradi
   - `GET /` -> health + available models  
   - `GET /models` -> enumerate `.pt` checkpoints discovered in `weights/`  
   - `POST /predict` -> multipart form (`file`, optional `model_name`)
+
+---
+
+### API Implementation & Usage
+- **Endpoints**: `api/main.py` exposes three routes via FastAPI:  
+  - `GET /` returns a health message and the list of classifier model names currently available.  
+  - `GET /models` surfaces the same model names alongside their on-disk paths.  
+  - `POST /predict` accepts a strip image and optional `model_name`, runs YOLO + classifier inference, and returns ppm predictions.
+- **Model names**: Auto-discovered from `weights/*.pt` (excluding the YOLO checkpoint). With the bundled weights you can pick any of:
+  - `twoheads_hetero_efficientnet_b0.ra_in1k`
+  - `twoheads_hetero_nfnet_f0.dm_in1k`
+  - `twoheads_hetero_convnext_base.fb_in1k`
+  - `twoheads_hetero_tf_efficientnet_b3.ns_jft_in1k`
+  Omit `model_name` to default to the first alphabetical match.
+- **Request contract** (`POST /predict`):
+  - Multipart form fields: `file` (image, PNG/JPEG), `model_name` (string, optional).
+  - Maximum payload size is governed by FastAPI/Uvicorn defaults; images are decoded with OpenCV.
+- **Response schema** (`PredictionResponse`):
+  ```json
+  {
+    "model": "twoheads_hetero_nfnet_f0.dm_in1k",
+    "chemical": "NO2",
+    "ppm": 1.7321,
+    "confidence": 0.9475,
+    "ppm_scaled": 0.6112,
+    "sigma": 0.1823
+  }
+  ```
+  - `chemical`: predicted strip type (`NH4` or `NO2`).  
+  - `ppm`: calibrated concentration estimate in parts per million.  
+  - `confidence`: softmax probability for the predicted class.  
+  - `ppm_scaled`: internal normalised regression output (useful for debugging).  
+  - `sigma`: heteroscedastic uncertainty (lower is more certain).
+- **Quick checks with `curl`**:
+  ```bash
+  curl http://localhost:8000/
+  curl http://localhost:8000/models
+  curl -X POST "http://localhost:8000/predict" ^
+       -F "file=@Spike_test_AI/NH4/Drinking water/2K5qd_..._0.15ppm.jpg" ^
+       -F "model_name=twoheads_hetero_convnext_base.fb_in1k"
+  ```
+  Replace the backslash (`^`) with `\` if you run the command on macOS/Linux.
+- **Python client example**:
+  ```python
+  import requests
+
+  url = "http://localhost:8000/predict"
+  with open("Spike_test_AI/NO2/Drinking water/sample.jpg", "rb") as handle:
+      response = requests.post(
+          url,
+          files={"file": handle},
+          data={"model_name": "twoheads_hetero_nfnet_f0.dm_in1k"},
+          timeout=30,
+      )
+  response.raise_for_status()
+  print(response.json())
+  ```
+  Wrap the request in try/except to capture `HTTP 404` (unknown model) or `422` (invalid image) responses surfaced by FastAPI.
 
 ---
 
