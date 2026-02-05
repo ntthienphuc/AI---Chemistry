@@ -238,20 +238,43 @@ class EMA:
     def __init__(self, model, decay=0.999):
         self.decay = decay
         self.shadow = {}
+        self.backup = {}
         for k, v in model.state_dict().items():
             if v.dtype.is_floating_point:
                 self.shadow[k] = v.detach().clone()
+
     @torch.no_grad()
     def update(self, model):
         for k, v in model.state_dict().items():
             if k in self.shadow and v.dtype.is_floating_point:
                 self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
-    def apply_to(self, model):
-        state = model.state_dict()
-        for k in self.shadow:
-            if k in state:
-                state[k].copy_(self.shadow[k])
 
+    @torch.no_grad()
+    def apply_to(self, model):
+        """
+        Apply EMA weights to model, saving original weights to self.backup so they
+        can be restored later via restore().
+        """
+        self.backup = {}
+        state = model.state_dict()
+        for k, v_ema in self.shadow.items():
+            if k in state and state[k].dtype.is_floating_point:
+                self.backup[k] = state[k].detach().clone()
+                state[k].copy_(v_ema)
+
+    @torch.no_grad()
+    def restore(self, model):
+        """
+        Restore original (non-EMA) weights after apply_to().
+        If apply_to() has not been called, this is a no-op.
+        """
+        if not self.backup:
+            return
+        state = model.state_dict()
+        for k, v in self.backup.items():
+            if k in state:
+                state[k].copy_(v)
+        self.backup = {}
 # ================= Evaluate =================
 @torch.no_grad()
 def evaluate(model, loader, device, ppm_scale, ppm_min, ppm_max, prefix="Eval"):
@@ -457,15 +480,14 @@ def train(args):
 
         # ---- validate (dÃ¹ng EMA weights náº¿u cÃ³) ----
         if ema is not None:
-            # backup & apply ema
-            backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            # temporarily apply EMA weights for validation
             ema.apply_to(model)
 
         val_logs = evaluate(model, val_loader, args.device, args.ppm_scale, ppm_min, ppm_max, prefix="Val")
 
         if ema is not None:
-            # restore
-            model.load_state_dict(backup, strict=False)
+            # restore original (non-EMA) weights
+            ema.restore(model)
 
         # val_score: Æ°u tiÃªn reg + classification
         # (moving average Ä‘á»ƒ mÆ°á»£t hÆ¡n)
@@ -490,9 +512,9 @@ def train(args):
                 'heteroscedastic': True
             }, args.save_path)
             logging.info("Saved best to %s", args.save_path)
-            # restore training weights (khÃ´ng cáº§n náº¿u ema.apply_to dÃ¹ng copy)
+            # restore training weights after temporarily applying EMA for saving
             if ema is not None:
-                model.load_state_dict(backup, strict=False)
+                ema.restore(model)
         else:
             patience += 1
             if patience >= args.patience:
