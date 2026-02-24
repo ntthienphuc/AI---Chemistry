@@ -35,7 +35,7 @@ Download all files/folders from this link:
 
 - https://drive.google.com/drive/folders/1EH5YPtrfB2QARHwZvKr2Q4DKsUS1PmQ3?usp=sharing
 
-Then place them into the existing `weights/` folder in this repo.
+Then place `weights/` folder in the main root next to `ai_chemistry` and `api` folder.
 
 Important:
 - Keep filenames unchanged.
