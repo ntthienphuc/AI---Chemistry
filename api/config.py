@@ -7,8 +7,13 @@ from typing import Dict, Optional
 
 
 def _default_root() -> Path:
-    # Set your project root once. Can be overridden with env AI_CHEM_ROOT.
-    return Path(os.environ.get("AI_CHEM_ROOT", r"D:\Project\AI - Chemistry")).resolve()
+    # Priority:
+    # 1) AI_CHEM_ROOT env var
+    # 2) project root inferred from this file location
+    root_env = os.environ.get("AI_CHEM_ROOT")
+    if root_env:
+        return Path(root_env).resolve()
+    return Path(__file__).resolve().parent.parent
 
 
 ROOT: Path = _default_root()
@@ -50,36 +55,36 @@ MODEL_ZOO: Dict[str, ModelSpec] = {
     "effb010k": ModelSpec(
         name="effb010k",
         ckpt_rel=r"weights\paper_lab10k\EffB0_seed0_l2.0.pt",
-        meta_rel=None,
+        meta_rel=r"weights\paper_lab10k\EffB0_seed0_l2.0.meta.json",
     ),
     "nfnet10k": ModelSpec(
         name="nfnet10k",
         ckpt_rel=r"weights\paper_lab10k\NFNet_seed0_l2.0.pt",
-        meta_rel=None,
+        meta_rel=r"weights\paper_lab10k\NFNet_seed0_l2.0.meta.json",
     ),
     "tfb310k": ModelSpec(
         name="tfb310k",
         ckpt_rel=r"weights\paper_lab10k\TFB3_seed0_l2.0.pt",
-        meta_rel=None,
+        meta_rel=r"weights\paper_lab10k\TFB3_seed0_l2.0.meta.json",
     ),
     "convnext3k": ModelSpec(
         name="convnext3k",
         ckpt_rel=r"weights\paper_field3k\ConvNext_field3k_seed0_l2.0_bs24.pt",
-        meta_rel=None,
+        meta_rel=r"weights\paper_field3k\ConvNext_field3k_seed0_l2.0_bs24.meta.json",
     ),
     "effb03k": ModelSpec(
         name="effb03k",
         ckpt_rel=r"weights\paper_field3k\EffB0_field3k_seed0_l2.0_bs24.pt",
-        meta_rel=None,
+        meta_rel=r"weights\paper_field3k\EffB0_field3k_seed0_l2.0_bs24.meta.json",
     ),
     "nfnet3k": ModelSpec(
         name="nfnet3k",
         ckpt_rel=r"weights\paper_field3k\DMNFNet_field3k_seed0_l2.0_bs24.pt",
-        meta_rel=None,
+        meta_rel=r"weights\paper_field3k\DMNFNet_field3k_seed0_l2.0_bs24.meta.json",
     ),
     "tfb33k": ModelSpec(
         name="tfb33k",
         ckpt_rel=r"weights\paper_field3k\TFB3_field3k_seed0_l2.0_bs24.pt",
-        meta_rel=None,
+        meta_rel=r"weights\paper_field3k\TFB3_field3k_seed0_l2.0_bs24.meta.json",
     ),
 }

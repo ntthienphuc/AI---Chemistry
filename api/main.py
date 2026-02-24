@@ -22,11 +22,15 @@ app = FastAPI(title="AI-Chemistry API", version="1.1.0")
 
 
 @lru_cache(maxsize=1)
+def _load_yolo(weights_path: str) -> YOLO:
+    return YOLO(weights_path)
+
+
 def get_yolo() -> YOLO | None:
     if not YOLO_WEIGHTS.exists():
         # Không có YOLO weights thì vẫn chạy fallback green/center
         return None
-    return YOLO(str(YOLO_WEIGHTS))
+    return _load_yolo(str(YOLO_WEIGHTS))
 
 
 @lru_cache(maxsize=16)
