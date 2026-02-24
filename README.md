@@ -172,6 +172,19 @@ Response format (`200 OK`):
 }
 ```
 
+Field meaning:
+- `predicted_chemical`: predicted analyte label (`NH4` or `NO2`).
+- `concentration.ppm`: predicted concentration value in ppm.
+- `chemical_confidence`: model confidence for the predicted class.
+- `concentration.ppm_ci95`: optional 95% confidence interval of ppm.
+- `concentration.ppm_sigma`: optional uncertainty spread (standard deviation) in ppm.
+- `roi`: ROI extraction metadata (source and bounding box used before classification/regression).
+- `raw`: only populated when `debug=true`, includes internal values for troubleshooting.
+
+If you only need the final result (predicted chemical name + ppm), focus on:
+- `predicted_chemical`
+- `concentration.ppm`
+
 Error behavior:
 - `400`: invalid `model` or invalid image decode
 - `422`: ROI extraction failure
