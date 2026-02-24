@@ -1,0 +1,13 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+
+numpy>=1.23
+opencv-python>=4.8
+
+torch>=2.0
+timm>=1.0
+ultralytics>=8.0
+
+pydantic>=2.6
+

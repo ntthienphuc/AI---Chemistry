@@ -1,221 +1,338 @@
-﻿## AI Chemistry Project
+# AI Chemistry Project Guide
 
-End-to-end toolkit for analysing NH4/NO2 test strips: splitting and cropping raw captures, training a dual-task classifier/regressor, running batched CLI inference, and deploying a FastAPI endpoint. The repository bundles every stage needed to reproduce the production pipeline that powers the reference weights inside `weights/`.
+This document is a complete start-to-finish guide for setting up the project, running the API, consuming the API, and running the training workflow.
 
----
+## 1) Environment Setup (From Zero)
 
-### Repository Layout
-- `ai_chemistry/data`: dataset utilities (`split_dataset`, YOLO ROI cropping, label generation)
-- `ai_chemistry/training`: training entry point for the two-head heteroscedastic backbone
-- `ai_chemistry/inference`: reusable inference pipeline plus optional NO2 calibration helper
-- `ai_chemistry/tools`: maintenance scripts (e.g. repacking checkpoints)
-- `weights/`: YOLO detector (`best.pt`) and four classifier checkpoints with their meta JSON
-- `Spike_test_AI/`: curated validation set used for quick regression tests
-- `api/main.py`: FastAPI surface over the inference pipeline
+### 1.1 Prerequisites
+- Python 3.10+ (recommended: 3.10 or 3.11)
+- `pip`
+- Windows PowerShell (examples below use PowerShell syntax)
 
----
+### 1.2 Create and activate a virtual environment
+From the project root (`D:\Project\AI - Chemistry`):
 
-### Methodology
-- **ROI detection**: Ultralytics YOLOv11-seg checkpoint (`weights/best.pt`) localises the strip mask. The largest mask is cropped with configurable padding (default 10%); detection boxes backstop missing masks.
-- **Color normalisation**: A green-border estimator rescales RGB intensities to reduce device lighting variability. The outer ring is converted to HSV, green pixels are filtered, and mean colour is used for per-channel normalisation.
-- **Feature extractor**: A timm backbone (EfficientNet, NFNet, ConvNeXt, TF-EfficientNet-B3) is fine-tuned without classifier head (`num_classes=0`) to produce dense features.
-- **Multi-task heads**:  
-  - `head_cls`: 2-way softmax for NH4 vs NO2.  
-  - `head_reg_NH4`, `head_reg_NO2`: each outputs `(mu, log_var)` so the model learns both the ppm value and its aleatoric uncertainty (heteroscedastic regression). During inference the head matching the predicted class is used.
-- **Optimisation**: Cross-entropy (optionally focal) for the classifier, Gaussian NLL for regression, Exponential Moving Average (EMA) on weights, Cosine LR with warmup, gradient clipping, and early stopping on a smoothed validation score.
-- **Test-time augmentation (TTA)**: Optional horizontal/vertical flips per image with median aggregation for ppm, weighted vote for class.
-
----
-
-### Pipeline Flow
-1. **Image ingestion**: raw capture is read from disk or HTTP upload.
-2. **YOLO detection**: ROI crop generated from segmentation mask (fallback to largest detection box).
-3. **Pre-process ROI**: green-border normalisation + resizing + ImageNet standardisation.
-4. **Model forward pass**: classifier predicts chemical, matching regression head returns ppm (inverse transform of log1p/minmax scale).
-5. **Post-process**: combine class, ppm, confidence, and estimated sigma; optionally apply NO2 linear calibration.
-
-The same flow powers both the CLI (`python -m ai_chemistry.inference.pipeline`) and the FastAPI service (`uvicorn api.main:app --reload`).
-
----
-
-### Available Weights
-| File | Backbone (timm) | Params (approx) | Notes |
-| --- | --- | --- | --- |
-| `best.pt` | YOLOv11-seg | 6M | Detect strip ROI |
-| `twoheads_hetero_efficientnet_b0.ra_in1k.pt` | EfficientNet-B0 | 25M | Lightweight baseline |
-| `twoheads_hetero_nfnet_f0.dm_in1k.pt` | NFNet-F0 | 292M | Highest accuracy on Spike set |
-| `twoheads_hetero_convnext_base.fb_in1k.pt` | ConvNeXt-Base | 357M | Strong balance between size and robustness |
-| `twoheads_hetero_tf_efficientnet_b3.ns_jft_in1k.pt` | TF-EfficientNet-B3 | 53M | Wider receptive field |
-
-Each `.pt` is paired with a `.meta.json` storing class order, ppm scaling, and image size, enabling the inference module to rebuild the architecture automatically.
-
-> **Weights download**: Grab the complete folder from https://drive.google.com/drive/folders/1yDxk7LtQoWzoArY87GYdXD_7xoKB0DlR?usp=sharing and drop everything into the repository’s `weights/` directory. The archive already contains the four classifier checkpoints plus `best.pt`; keep the filenames unchanged so the API can auto-discover them.
-
----
-
-### Environment Setup
-```bash
+```powershell
 python -m venv .venv
-.venv\Scripts\activate        # use `source .venv/bin/activate` on Linux/macOS
-pip install --upgrade pip
+.\.venv\Scripts\Activate.ps1
+```
+
+If PowerShell blocks activation, run once:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
+### 1.3 Install dependencies
+
+```powershell
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
----
+### 1.4 Download model weights (Google Drive)
+Download all files/folders from this link:
 
-### Dataset Preparation Workflow
-1. **Split raw captures**
-   ```bash
-   python -m ai_chemistry.data.split_dataset \
-     --source-root "path/to/NH4_NO2_sorted round-2" \
-     --output-root data/raw_split \
-     --seed 150
-   ```
-2. **Crop YOLO ROI**
-   ```bash
-   python -m ai_chemistry.data.crop_roi \
-     --yolo-weights weights/best.pt \
-     --input-root data/raw_split \
-     --output-root data/images
-   ```
-3. **Generate labels**
-   ```bash
-   python -m ai_chemistry.data.generate_labels \
-     --images-root data/images \
-     --output-csv data/labels.csv
-   ```
+- https://drive.google.com/drive/folders/1EH5YPtrfB2QARHwZvKr2Q4DKsUS1PmQ3?usp=sharing
 
----
+Then place them into the existing `weights/` folder in this repo.
 
-### Training
+Important:
+- Keep filenames unchanged.
+- Keep the subfolder structure unchanged.
+- `best.pt` must be directly inside `weights/`.
+
+Expected structure:
+
+```text
+weights/
+  best.pt
+  paper_lab10k/
+    ConvNext_seed0_l2.0.pt
+    ConvNext_seed0_l2.0.meta.json
+    EffB0_seed0_l2.0.pt
+    EffB0_seed0_l2.0.meta.json
+    NFNet_seed0_l2.0.pt
+    NFNet_seed0_l2.0.meta.json
+    TFB3_seed0_l2.0.pt
+    TFB3_seed0_l2.0.meta.json
+  paper_field3k/
+    ConvNext_field3k_seed0_l2.0_bs24.pt
+    ConvNext_field3k_seed0_l2.0_bs24.meta.json
+    EffB0_field3k_seed0_l2.0_bs24.pt
+    EffB0_field3k_seed0_l2.0_bs24.meta.json
+    DMNFNet_field3k_seed0_l2.0_bs24.pt
+    DMNFNet_field3k_seed0_l2.0_bs24.meta.json
+    TFB3_field3k_seed0_l2.0_bs24.pt
+    TFB3_field3k_seed0_l2.0_bs24.meta.json
+```
+
+Quick check:
+
+```powershell
+Get-ChildItem -Recurse .\weights
+```
+
+## 2) Run the API
+
+### 2.1 Start API server
+From project root with venv activated:
+
+```powershell
+uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### 2.2 Available endpoints
+- `GET /health`
+- `GET /models`
+- `POST /predict`
+
+### 2.3 Optional runtime environment variables
+You can override config values in `api/config.py`:
+
+```powershell
+$env:AI_CHEM_ROOT = "D:\Project\AI - Chemistry"
+$env:AI_CHEM_YOLO = "D:\Project\AI - Chemistry\weights\best.pt"
+$env:AI_CHEM_DEVICE = "cuda"      # or "cpu"
+$env:AI_CHEM_CALIB = "greenborder" # or "none"
+```
+
+After setting env vars, restart Uvicorn.
+
+## 3) Use the API (Multiple Methods + Input/Output Format)
+
+### 3.1 Endpoint contract
+
+#### `GET /health`
+Purpose: health check.
+
+Example response:
+
+```json
+{
+  "status": "ok"
+}
+```
+
+#### `GET /models`
+Purpose: list valid model keys for prediction.
+
+Example response:
+
+```json
+{
+  "available_models": [
+    "convnext10k",
+    "convnext3k",
+    "effb010k",
+    "effb03k",
+    "nfnet10k",
+    "nfnet3k",
+    "tfb310k",
+    "tfb33k"
+  ],
+  "yolo_weights": "D:\\Project\\AI - Chemistry\\weights\\best.pt",
+  "device": "cuda",
+  "calib_mode": "greenborder"
+}
+```
+
+#### `POST /predict`
+Purpose: predict chemical class and concentration from one uploaded image.
+
+Request format:
+- Query params:
+  - `model` (required): one value from `/models`
+  - `roi_mode` (optional, default `auto`): `auto | yolo | green | center`
+  - `debug` (optional, default `false`): return raw internals when `true`
+- Multipart form:
+  - `file` (required): image file (`.jpg`, `.jpeg`, `.png`)
+
+Response format (`200 OK`):
+
+```json
+{
+  "model": "convnext10k",
+  "predicted_chemical": "NO2",
+  "chemical_confidence": 0.9734,
+  "concentration": {
+    "ppm": 1.24,
+    "ppm_ci95": [1.01, 1.48],
+    "ppm_sigma": 0.12,
+    "method": "heteroscedastic_gaussian"
+  },
+  "calib_mode": "greenborder",
+  "roi": {
+    "source": "mask",
+    "bbox_xyxy": [120, 85, 650, 920],
+    "padding": 0.1,
+    "imgsz": 640
+  },
+  "raw": null
+}
+```
+
+Error behavior:
+- `400`: invalid `model` or invalid image decode
+- `422`: ROI extraction failure
+- `500`: model inference failure
+
+### 3.2 Method A: Swagger UI (browser)
+1. Open `http://127.0.0.1:8000/docs`
+2. Try `GET /models` first.
+3. Open `POST /predict`.
+4. Fill query `model` with a valid key from `/models`.
+5. Upload `file`.
+6. Execute and inspect JSON response.
+
+### 3.3 Method B: cURL (terminal)
+
 ```bash
-python -m ai_chemistry.training.train_classifier \
-  --root_dir data/images \
-  --labels_csv data/labels.csv \
-  --timm_name efficientnetv2_s \
-  --epochs 60 \
-  --save_path weights/custom_twoheads.pt
+curl -X POST "http://127.0.0.1:8000/predict?model=convnext10k&roi_mode=auto&debug=false" \
+  -F "file=@Spike_test_AI/NH4/Drinking water/sample.jpg"
 ```
-Use `--help` for options covering learning rate, warmup epochs, EMA decay, gradient clipping, loss settings (focal, label smoothing), ppm scaling, and random seed.
+
+### 3.4 Method C: PowerShell (`Invoke-RestMethod`)
+
+```powershell
+$url = "http://127.0.0.1:8000/predict?model=convnext10k&roi_mode=auto&debug=true"
+$form = @{ file = Get-Item "D:\Project\AI - Chemistry\Spike_test_AI\NH4\Drinking water\sample.jpg" }
+Invoke-RestMethod -Uri $url -Method Post -Form $form
+```
+
+### 3.5 Method D: Python (`requests`)
+
+```python
+import requests
+
+url = "http://127.0.0.1:8000/predict"
+params = {
+    "model": "convnext10k",
+    "roi_mode": "auto",
+    "debug": False,
+}
+
+with open(r"Spike_test_AI/NH4/Drinking water/sample.jpg", "rb") as f:
+    resp = requests.post(url, params=params, files={"file": f}, timeout=60)
+
+resp.raise_for_status()
+print(resp.json())
+```
+
+### 3.6 Method E: Postman
+- Method: `POST`
+- URL: `http://127.0.0.1:8000/predict?model=convnext10k&roi_mode=auto&debug=false`
+- Body -> `form-data`
+  - key `file`, type `File`, value = your image
+- Send and inspect JSON response
+
+## 4) General Training Workflow
+
+This section is intentionally general and practical. The exact experiment settings can vary by dataset size and device.
+
+### 4.1 Prepare raw data
+Recommended raw structure:
+
+```text
+<raw_root>/
+  NH4/
+    <device>/
+      <round_or_session>/
+        *.jpg|*.jpeg|*.png
+  NO2/
+    <device>/
+      <round_or_session>/
+        *.jpg|*.jpeg|*.png
+```
+
+### 4.2 Split dataset into train/val/test
+Preferred (group-aware, avoids leakage across near-duplicate captures):
+
+```powershell
+python ai_chemistry/data/split_dataset_grouped.py `
+  --source-root "D:\path\to\raw_data" `
+  --output-root "D:\path\to\data_split" `
+  --train 0.7 --val 0.15 --test 0.15 `
+  --seed 150
+```
+
+Optional: add `--manifest-json` for reproducible splits, or `--holdout-devices` for cross-device evaluation.
+
+### 4.3 Crop ROI using YOLO
+
+```powershell
+python ai_chemistry/data/crop_roi.py `
+  --yolo-weights "weights\best.pt" `
+  --input-root "D:\path\to\data_split" `
+  --output-root "D:\path\to\data_roi" `
+  --padding 0.10 --conf 0.25 --imgsz 640
+```
+
+### 4.4 Generate labels CSV
+
+```powershell
+python ai_chemistry/data/generate_labels.py `
+  --images-root "D:\path\to\data_roi" `
+  --output-csv "D:\path\to\data_clsreg\labels.csv"
+```
+
+Expected columns in CSV:
+- `path`
+- `chemical` (`NH4` or `NO2`)
+- `ppm`
+- `device`
+- `datetime`
+- `split`
+
+Optional cleaning step (drop unreadable files):
+
+```powershell
+python ai_chemistry/data/clean_labels.py `
+  --root-dir "D:\path\to\data_clsreg" `
+  --labels-csv "D:\path\to\data_clsreg\labels.csv" `
+  --output-csv "D:\path\to\data_clsreg\labels.clean.csv"
+```
+
+### 4.5 Train a model
+
+```powershell
+python ai_chemistry/training/train_classifier.py `
+  --root_dir "D:\path\to\data_clsreg" `
+  --labels_csv "D:\path\to\data_clsreg\labels.csv" `
+  --timm_name "convnext_base.fb_in1k" `
+  --image_size 224 `
+  --batch_size 24 `
+  --epochs 60 `
+  --warmup_epochs 5 `
+  --save_path "weights\custom\convnext_custom.pt" `
+  --device cuda `
+  --calib greenborder
+```
+
+Training output:
+- model checkpoint: `*.pt`
+- metadata file: matching `*.meta.json`
+
+### 4.6 Evaluate a trained checkpoint
+
+```powershell
+python ai_chemistry/training/test_classifier.py `
+  --root_dir "D:\path\to\data_clsreg" `
+  --labels_csv "D:\path\to\data_clsreg\labels.csv" `
+  --ckpt_path "weights\custom\convnext_custom.pt" `
+  --split test `
+  --device cuda
+```
+
+Optional: append metrics to CSV with `--csv_path`.
+
+### 4.7 Practical training notes
+- Start with one backbone (`convnext_base.fb_in1k` or `efficientnetv2_s`) before large sweeps.
+- Keep calibration mode consistent between training and serving (`greenborder` vs `none`).
+- Always validate on `val` before comparing `test` performance.
+- Save split manifests for reproducibility when comparing experiments.
+- Keep model and meta file together (`.pt` + `.meta.json`) for deployment.
 
 ---
 
-### Inference Options
-- **CLI batch mode**
-  ```bash
-  python -m ai_chemistry.inference.pipeline \
-    --input-path Spike_test_AI \
-    --yolo-weights weights/best.pt \
-    --classifier-weights weights/twoheads_hetero_nfnet_f0.dm_in1k.pt \
-    --output-csv outputs/predictions.csv
-  ```
-- **NO2 calibration (optional)**
-  ```bash
-  python -m ai_chemistry.inference.calibrate_no2 \
-    --csv-path outputs/predictions_with_gt.csv \
-    --output-csv outputs/predictions_calibrated.csv \
-    --save-model
-  ```
-- **FastAPI service**
-  ```bash
-  uvicorn api.main:app --reload --port 8000
-  ```
-  - `GET /` -> health + available models  
-  - `GET /models` -> enumerate `.pt` checkpoints discovered in `weights/`  
-  - `POST /predict` -> multipart form (`file`, optional `model_name`)
-
----
-
-### API Implementation & Usage
-- **Endpoints**: `api/main.py` exposes three routes via FastAPI:  
-  - `GET /` returns a health message and the list of classifier model names currently available.  
-  - `GET /models` surfaces the same model names alongside their on-disk paths.  
-  - `POST /predict` accepts a strip image and optional `model_name`, runs YOLO + classifier inference, and returns ppm predictions.
-- **Model names**: Auto-discovered from `weights/*.pt` (excluding the YOLO checkpoint). With the bundled weights you can pick any of:
-  - `twoheads_hetero_efficientnet_b0.ra_in1k`
-  - `twoheads_hetero_nfnet_f0.dm_in1k`
-  - `twoheads_hetero_convnext_base.fb_in1k`
-  - `twoheads_hetero_tf_efficientnet_b3.ns_jft_in1k`
-  Omit `model_name` to default to the first alphabetical match.
-- **Request contract** (`POST /predict`):
-  - Multipart form fields: `file` (image, PNG/JPEG), `model_name` (string, optional).
-  - Maximum payload size is governed by FastAPI/Uvicorn defaults; images are decoded with OpenCV.
-- **Response schema** (`PredictionResponse`):
-  ```json
-  {
-    "model": "twoheads_hetero_nfnet_f0.dm_in1k",
-    "chemical": "NO2",
-    "ppm": 1.7321,
-    "confidence": 0.9475,
-    "ppm_scaled": 0.6112,
-    "sigma": 0.1823
-  }
-  ```
-  - `chemical`: predicted strip type (`NH4` or `NO2`).  
-  - `ppm`: calibrated concentration estimate in parts per million.  
-  - `confidence`: softmax probability for the predicted class.  
-  - `ppm_scaled`: internal normalised regression output (useful for debugging).  
-  - `sigma`: heteroscedastic uncertainty (lower is more certain).
-- **Quick checks with `curl`**:
-  ```bash
-  curl http://localhost:8000/
-  curl http://localhost:8000/models
-  curl -X POST "http://localhost:8000/predict" ^
-       -F "file=@Spike_test_AI/NH4/Drinking water/2K5qd_..._0.15ppm.jpg" ^
-       -F "model_name=twoheads_hetero_convnext_base.fb_in1k"
-  ```
-  Replace the backslash (`^`) with `\` if you run the command on macOS/Linux.
-- **Python client example**:
-  ```python
-  import requests
-
-  url = "http://localhost:8000/predict"
-  with open("Spike_test_AI/NO2/Drinking water/sample.jpg", "rb") as handle:
-      response = requests.post(
-          url,
-          files={"file": handle},
-          data={"model_name": "twoheads_hetero_nfnet_f0.dm_in1k"},
-          timeout=30,
-      )
-  response.raise_for_status()
-  print(response.json())
-  ```
-  Wrap the request in try/except to capture `HTTP 404` (unknown model) or `422` (invalid image) responses surfaced by FastAPI.
-
----
-
-### Spike_test_AI Evaluation
-Metrics were captured by running the legacy `5_2_4.py` script with consistent settings (`--tta 2 --pad 0.10 --ring_frac 0.10 --min_green_pixels 500 --no-apply_calibration --clip_zero`). The same backbones can be loaded through the new pipeline.
-
-| Classifier | Overall Acc | F1 | MAE (ppm) | MAPE | NH4 Acc | NO2 Acc | Drinking Water Acc | RO Water Acc | Tap Water Acc |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| EfficientNet-B0 (RA) | 0.7789 | 0.7589 | 0.2424 | 0.4361 | 1.0000 | 0.4878 | 0.8333 | 0.7143 | 0.8000 |
-| NFNet-F0 (DM) | **0.8842** | **0.8806** | 0.2363 | 0.4315 | 1.0000 | 0.7317 | **0.9333** | **0.8571** | **0.8667** |
-| ConvNeXt-Base (FB) | 0.8842 | 0.8806 | **0.2333** | **0.4280** | 1.0000 | 0.7317 | 0.9000 | 0.8857 | 0.8667 |
-| TF-EfficientNet-B3 (NS) | 0.8211 | 0.8098 | 0.2442 | 0.4571 | 1.0000 | 0.5854 | 0.8333 | 0.7714 | 0.8667 |
-
-Key observations:
-- All backbones achieve perfect classification on NH4 samples; NO2 dominates residual errors.
-- ConvNeXt-Base edges NFNet-F0 on regression accuracy (MAE/MAPE), while NFNet-F0 ties on classification and is steadier across water types.
-- The largest ppm misses arise from NO2 samples in low-light or reflective conditions (e.g. Samsung S20 drinking water capture predicted 1.99-2.67 ppm vs 1 ppm GT).
-
-Representative hard cases (predicted ppm vs ground-truth):
-- `Spike_test_AI/NO2/Drinking water/ozI0H_..._1ppm.jpg` -> predicted 1.98-2.67 ppm (strong glare).
-- `Spike_test_AI/NO2/RO water/FPAOH_..._1ppm.jpg` -> EfficientNet-B0 and TF-EfficientNet-B3 misclassified as NH4 at ~0.04 ppm.
-- `Spike_test_AI/NO2/RO water/3RTuX_..._1ppm.jpg` -> low ppm estimates across models (0.41-0.44 ppm) except NFNet-F0 due to darker ROI.
-
----
-
-### Quick Self-Test
-```bash
-python -m ai_chemistry.inference.pipeline \
-  --input-path Spike_test_AI/NH4/Drinking water/2K5qd_..._0.15ppm.jpg \
-  --yolo-weights weights/best.pt \
-  --classifier-weights weights/twoheads_hetero_efficientnet_b0.ra_in1k.pt
-```
-Expected output resembles:
-```
-{'chemical': 'NH4', 'ppm': 0.0432, 'confidence': 0.9893, 'ppm_scaled': 0.0423, 'sigma': 0.0498}
-```
-
-Use `--classifier-weights` to swap to any of the four checkpoints above or to a newly trained model.
+If you need, this guide can be extended with a reproducible experiment template (folder conventions, naming, and run logs).
