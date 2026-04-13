@@ -33,7 +33,7 @@ pip install -r requirements.txt
 ### 1.4 Download model weights (Google Drive)
 Download all files/folders from this link:
 
-- https://drive.google.com/drive/folders/1EH5YPtrfB2QARHwZvKr2Q4DKsUS1PmQ3?usp=sharing
+- https://drive.google.com/drive/folders/12lvPMyir46usQyKULd2RU_uE_CvoVKkS?usp=sharing
 
 Then place `weights/` folder in the main root next to `ai_chemistry` and `api` folder.
 
