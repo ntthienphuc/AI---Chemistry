@@ -30,6 +30,9 @@ class PredictResponse(BaseModel):
 
 class ModelsResponse(BaseModel):
     available_models: List[str]
+    available_data_types: List[str]
+    available_model_types: List[str]
+    available_train_calibs: List[str]
     available_calib_modes: List[str]
     yolo_weights: str
     device: str

@@ -140,6 +140,9 @@ Example response:
     "tfb33k_green",
     "tfb33k_none"
   ],
+  "available_data_types": ["3k", "10k", "13k"],
+  "available_model_types": ["convnext", "effb0", "mnv3", "nfnet", "swint", "tfb3"],
+  "available_train_calibs": ["green", "none"],
   "available_calib_modes": ["greenborder", "none"],
   "yolo_weights": "D:\\Project\\AI - Chemistry\\weights\\best.pt",
   "device": "cuda",
@@ -152,17 +155,26 @@ Purpose: predict chemical class and concentration from one uploaded image.
 
 Request format:
 - Query params:
-  - `model` (required): one value from `/models`
+  - `model` (optional): full model key from `/models`, for example `convnext10k_green`
+  - `data_type` (optional): `3k | 10k | 13k`, used when `model` is omitted
+  - `model_type` (optional): `convnext | effb0 | mnv3 | nfnet | swint | tfb3`, used when `model` is omitted
+  - `train_calib` (optional): `green | none`, used when `model` is omitted
   - `roi_mode` (optional, default `auto`): `auto | yolo | green | center`
-  - `calib_mode` (optional, default from `api/config.py`): `greenborder | none`
+  - `calib_mode` (optional): `greenborder | none`; when omitted, the API infers it from the selected model suffix
   - `debug` (optional, default `false`): return raw internals when `true`
 - Multipart form:
   - `file` (required): image file (`.jpg`, `.jpeg`, `.png`)
 
+Model selection:
+- Full key mode: pass `model=convnext10k_green`.
+- Component mode: omit `model` and pass `data_type=10k&model_type=convnext&train_calib=green`.
+- Component mode builds the same key format: `{model_type}{data_type}_{train_calib}`.
+
 Model/calibration pairing:
 - Old-style model keys without suffix, such as `convnext10k`, are aliases to the `_green` checkpoints.
-- For green-border calibrated inference, use a `_green` model with `calib_mode=greenborder`.
-- For no-calibration inference, use a `_none` model with `calib_mode=none`.
+- `_green` checkpoints default to `calib_mode=greenborder`.
+- `_none` checkpoints default to `calib_mode=none`.
+- You can still override runtime preprocessing by explicitly passing `calib_mode`.
 
 Response format (`200 OK`):
 
@@ -211,21 +223,30 @@ Error behavior:
 1. Open `http://127.0.0.1:8000/docs`
 2. Try `GET /models` first.
 3. Open `POST /predict`.
-4. Fill query `model` with a valid key from `/models`.
+4. Fill query `model` with a valid key from `/models`, or use `data_type`, `model_type`, and `train_calib`.
 5. Upload `file`.
 6. Execute and inspect JSON response.
 
 ### 3.3 Method B: cURL (terminal)
 
+Full model key:
+
 ```bash
-curl -X POST "http://127.0.0.1:8000/predict?model=convnext10k_green&roi_mode=auto&calib_mode=greenborder&debug=false" \
+curl -X POST "http://127.0.0.1:8000/predict?model=convnext10k_green&roi_mode=auto&debug=false" \
+  -F "file=@Spike_test_AI/NH4/Drinking water/sample.jpg"
+```
+
+Component fields:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/predict?data_type=10k&model_type=convnext&train_calib=green&roi_mode=auto&debug=false" \
   -F "file=@Spike_test_AI/NH4/Drinking water/sample.jpg"
 ```
 
 ### 3.4 Method C: PowerShell (`Invoke-RestMethod`)
 
 ```powershell
-$url = "http://127.0.0.1:8000/predict?model=convnext10k_green&roi_mode=auto&calib_mode=greenborder&debug=true"
+$url = "http://127.0.0.1:8000/predict?data_type=10k&model_type=convnext&train_calib=green&roi_mode=auto&debug=true"
 $form = @{ file = Get-Item "D:\Project\AI - Chemistry\Spike_test_AI\NH4\Drinking water\sample.jpg" }
 Invoke-RestMethod -Uri $url -Method Post -Form $form
 ```
@@ -237,9 +258,10 @@ import requests
 
 url = "http://127.0.0.1:8000/predict"
 params = {
-    "model": "convnext10k_green",
+    "data_type": "10k",
+    "model_type": "convnext",
+    "train_calib": "green",
     "roi_mode": "auto",
-    "calib_mode": "greenborder",
     "debug": False,
 }
 
@@ -252,7 +274,7 @@ print(resp.json())
 
 ### 3.6 Method E: Postman
 - Method: `POST`
-- URL: `http://127.0.0.1:8000/predict?model=convnext10k_green&roi_mode=auto&calib_mode=greenborder&debug=false`
+- URL: `http://127.0.0.1:8000/predict?data_type=10k&model_type=convnext&train_calib=green&roi_mode=auto&debug=false`
 - Body -> `form-data`
   - key `file`, type `File`, value = your image
 - Send and inspect JSON response

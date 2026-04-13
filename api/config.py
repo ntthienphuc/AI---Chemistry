@@ -22,6 +22,9 @@ DEVICE: str = "cuda"
 # - "none"        : no calibration
 CALIB_MODE: str = "greenborder"
 VALID_CALIB_MODES = ("greenborder", "none")
+VALID_DATA_TYPES = ("3k", "10k", "13k")
+VALID_MODEL_TYPES = ("convnext", "effb0", "mnv3", "nfnet", "swint", "tfb3")
+VALID_TRAIN_CALIBS = ("green", "none")
 
 
 @dataclass(frozen=True)
