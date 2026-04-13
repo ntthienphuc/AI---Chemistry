@@ -54,6 +54,14 @@ def infer_reg_out_dim(state: Dict[str, torch.Tensor]) -> int:
     return 2  # fallback
 
 
+def infer_head_in_features(state: Dict[str, torch.Tensor]) -> Optional[int]:
+    # input feature dim expected by the first Linear layer in the saved head
+    for cand in ("head_cls.0.weight", "head_cls.1.weight", "head_cls.weight"):
+        if cand in state:
+            return int(state[cand].shape[1])
+    return None
+
+
 class MultiTaskHeteroFlexible(nn.Module):
     def __init__(
         self,
@@ -64,12 +72,14 @@ class MultiTaskHeteroFlexible(nn.Module):
         drop_path: float = 0.1,
         head_variant: str = "mlp2",
         reg_out_dim: int = 2,
+        expected_feat_dim: Optional[int] = None,
     ):
         super().__init__()
         self.timm_name = timm_name
         self.num_classes = int(num_classes)
         self.head_variant = head_variant
         self.reg_out_dim = int(reg_out_dim)
+        self.use_forward_head_features = False
 
         self.backbone = timm.create_model(
             timm_name,
@@ -83,6 +93,15 @@ class MultiTaskHeteroFlexible(nn.Module):
             feat_dim = self.backbone.feature_info[-1]["num_chs"]
         if feat_dim is None:
             raise RuntimeError(f"Không tìm được feat_dim cho timm model: {timm_name}")
+
+        if expected_feat_dim is not None and int(expected_feat_dim) != int(feat_dim):
+            if not hasattr(self.backbone, "forward_features") or not hasattr(self.backbone, "forward_head"):
+                raise RuntimeError(
+                    f"Checkpoint expects feat_dim={expected_feat_dim}, but backbone returns feat_dim={feat_dim} "
+                    f"and does not expose forward_features/forward_head."
+                )
+            feat_dim = int(expected_feat_dim)
+            self.use_forward_head_features = True
 
         if head_variant == "linear":
             self.head_cls = nn.Sequential(nn.Dropout(0.3), nn.Linear(feat_dim, self.num_classes))
@@ -109,8 +128,17 @@ class MultiTaskHeteroFlexible(nn.Module):
                 nn.Linear(512, self.reg_out_dim),
             )
 
+    def _extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.use_forward_head_features:
+            return self.backbone(x)
+        feats = self.backbone.forward_features(x)
+        try:
+            return self.backbone.forward_head(feats, pre_logits=True)
+        except TypeError:
+            return self.backbone.forward_head(feats)
+
     def forward(self, x: torch.Tensor):
-        feats = self.backbone(x)
+        feats = self._extract_features(x)
         cls_out = self.head_cls(feats)
         reg_NH4 = self.head_reg_NH4(feats)
         reg_NO2 = self.head_reg_NO2(feats)

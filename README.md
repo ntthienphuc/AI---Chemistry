@@ -47,25 +47,18 @@ Expected structure:
 ```text
 weights/
   best.pt
-  paper_lab10k/
-    ConvNext_seed0_l2.0.pt
-    ConvNext_seed0_l2.0.meta.json
-    EffB0_seed0_l2.0.pt
-    EffB0_seed0_l2.0.meta.json
-    NFNet_seed0_l2.0.pt
-    NFNet_seed0_l2.0.meta.json
-    TFB3_seed0_l2.0.pt
-    TFB3_seed0_l2.0.meta.json
-  paper_field3k/
-    ConvNext_field3k_seed0_l2.0_bs24.pt
-    ConvNext_field3k_seed0_l2.0_bs24.meta.json
-    EffB0_field3k_seed0_l2.0_bs24.pt
-    EffB0_field3k_seed0_l2.0_bs24.meta.json
-    DMNFNet_field3k_seed0_l2.0_bs24.pt
-    DMNFNet_field3k_seed0_l2.0_bs24.meta.json
-    TFB3_field3k_seed0_l2.0_bs24.pt
-    TFB3_field3k_seed0_l2.0_bs24.meta.json
+  runs_multitask_3k/
+    <Backbone>_seed0_l2.0_<calib>.pt
+    <Backbone>_seed0_l2.0_<calib>.meta.json
+  runs_multitask_10k/
+    <Backbone>_seed0_l2.0_<calib>.pt
+    <Backbone>_seed0_l2.0_<calib>.meta.json
+  runs_multitask_13k/
+    <Backbone>_seed0_l2.0_<calib>.pt
+    <Backbone>_seed0_l2.0_<calib>.meta.json
 ```
+
+Where `<Backbone>` is one of `ConvNext`, `EffB0`, `MNV3`, `NFNet`, `SwinT`, `TFB3`, and `<calib>` is `green` or `none`.
 
 Quick check:
 
@@ -86,18 +79,6 @@ uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 - `GET /health`
 - `GET /models`
 - `POST /predict`
-
-### 2.3 Optional runtime environment variables
-You can override config values in `api/config.py`:
-
-```powershell
-$env:AI_CHEM_ROOT = "D:\Project\AI - Chemistry"
-$env:AI_CHEM_YOLO = "D:\Project\AI - Chemistry\weights\best.pt"
-$env:AI_CHEM_DEVICE = "cuda"      # or "cpu"
-$env:AI_CHEM_CALIB = "greenborder" # or "none"
-```
-
-After setting env vars, restart Uvicorn.
 
 ## 3) Use the API (Multiple Methods + Input/Output Format)
 
@@ -123,14 +104,61 @@ Example response:
 {
   "available_models": [
     "convnext10k",
+    "convnext10k_green",
+    "convnext10k_none",
+    "convnext13k",
+    "convnext13k_green",
+    "convnext13k_none",
     "convnext3k",
+    "convnext3k_green",
+    "convnext3k_none",
     "effb010k",
+    "effb010k_green",
+    "effb010k_none",
+    "effb013k",
+    "effb013k_green",
+    "effb013k_none",
     "effb03k",
+    "effb03k_green",
+    "effb03k_none",
+    "mnv310k",
+    "mnv310k_green",
+    "mnv310k_none",
+    "mnv313k",
+    "mnv313k_green",
+    "mnv313k_none",
+    "mnv33k",
+    "mnv33k_green",
+    "mnv33k_none",
     "nfnet10k",
+    "nfnet10k_green",
+    "nfnet10k_none",
+    "nfnet13k",
+    "nfnet13k_green",
+    "nfnet13k_none",
     "nfnet3k",
+    "nfnet3k_green",
+    "nfnet3k_none",
+    "swint10k",
+    "swint10k_green",
+    "swint10k_none",
+    "swint13k",
+    "swint13k_green",
+    "swint13k_none",
+    "swint3k",
+    "swint3k_green",
+    "swint3k_none",
     "tfb310k",
-    "tfb33k"
+    "tfb310k_green",
+    "tfb310k_none",
+    "tfb313k",
+    "tfb313k_green",
+    "tfb313k_none",
+    "tfb33k",
+    "tfb33k_green",
+    "tfb33k_none"
   ],
+  "available_calib_modes": ["greenborder", "none"],
   "yolo_weights": "D:\\Project\\AI - Chemistry\\weights\\best.pt",
   "device": "cuda",
   "calib_mode": "greenborder"
@@ -144,9 +172,15 @@ Request format:
 - Query params:
   - `model` (required): one value from `/models`
   - `roi_mode` (optional, default `auto`): `auto | yolo | green | center`
+  - `calib_mode` (optional, default from `api/config.py`): `greenborder | none`
   - `debug` (optional, default `false`): return raw internals when `true`
 - Multipart form:
   - `file` (required): image file (`.jpg`, `.jpeg`, `.png`)
+
+Model/calibration pairing:
+- Old-style model keys without suffix, such as `convnext10k`, are aliases to the `_green` checkpoints.
+- For green-border calibrated inference, use a `_green` model with `calib_mode=greenborder`.
+- For no-calibration inference, use a `_none` model with `calib_mode=none`.
 
 Response format (`200 OK`):
 
@@ -178,6 +212,7 @@ Field meaning:
 - `chemical_confidence`: model confidence for the predicted class.
 - `concentration.ppm_ci95`: optional 95% confidence interval of ppm.
 - `concentration.ppm_sigma`: optional uncertainty spread (standard deviation) in ppm.
+- `calib_mode`: calibration/preprocessing mode used for this request.
 - `roi`: ROI extraction metadata (source and bounding box used before classification/regression).
 - `raw`: only populated when `debug=true`, includes internal values for troubleshooting.
 
@@ -201,14 +236,14 @@ Error behavior:
 ### 3.3 Method B: cURL (terminal)
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/predict?model=convnext10k&roi_mode=auto&debug=false" \
+curl -X POST "http://127.0.0.1:8000/predict?model=convnext10k_green&roi_mode=auto&calib_mode=greenborder&debug=false" \
   -F "file=@Spike_test_AI/NH4/Drinking water/sample.jpg"
 ```
 
 ### 3.4 Method C: PowerShell (`Invoke-RestMethod`)
 
 ```powershell
-$url = "http://127.0.0.1:8000/predict?model=convnext10k&roi_mode=auto&debug=true"
+$url = "http://127.0.0.1:8000/predict?model=convnext10k_green&roi_mode=auto&calib_mode=greenborder&debug=true"
 $form = @{ file = Get-Item "D:\Project\AI - Chemistry\Spike_test_AI\NH4\Drinking water\sample.jpg" }
 Invoke-RestMethod -Uri $url -Method Post -Form $form
 ```
@@ -220,8 +255,9 @@ import requests
 
 url = "http://127.0.0.1:8000/predict"
 params = {
-    "model": "convnext10k",
+    "model": "convnext10k_green",
     "roi_mode": "auto",
+    "calib_mode": "greenborder",
     "debug": False,
 }
 
@@ -234,7 +270,7 @@ print(resp.json())
 
 ### 3.6 Method E: Postman
 - Method: `POST`
-- URL: `http://127.0.0.1:8000/predict?model=convnext10k&roi_mode=auto&debug=false`
+- URL: `http://127.0.0.1:8000/predict?model=convnext10k_green&roi_mode=auto&calib_mode=greenborder&debug=false`
 - Body -> `form-data`
   - key `file`, type `File`, value = your image
 - Send and inspect JSON response

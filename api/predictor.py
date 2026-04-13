@@ -17,6 +17,7 @@ from .modeling import (
     Meta,
     MultiTaskHeteroFlexible,
     build_meta_from_ckpt,
+    infer_head_in_features,
     infer_head_variant,
     infer_reg_out_dim,
     strip_state_dict_prefix,
@@ -90,6 +91,7 @@ class LoadedPredictor:
         # infer which head style this ckpt expects
         head_variant = infer_head_variant(state)
         reg_out_dim = infer_reg_out_dim(state)
+        expected_feat_dim = infer_head_in_features(state)
 
         # build model
         self.model = MultiTaskHeteroFlexible(
@@ -100,6 +102,7 @@ class LoadedPredictor:
             drop_path=self.meta.drop_path,
             head_variant=head_variant,
             reg_out_dim=reg_out_dim,
+            expected_feat_dim=expected_feat_dim,
         )
 
         # load weights (try strict first; fallback if needed)
@@ -116,6 +119,7 @@ class LoadedPredictor:
                 drop_path=self.meta.drop_path,
                 head_variant=alt,
                 reg_out_dim=reg_out_dim,
+                expected_feat_dim=expected_feat_dim,
             )
             self.model.load_state_dict(state, strict=True)
 

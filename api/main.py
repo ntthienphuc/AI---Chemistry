@@ -9,7 +9,7 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 from ultralytics import YOLO
 
-from .config import CALIB_MODE, DEVICE, MODEL_ZOO, YOLO_WEIGHTS
+from .config import CALIB_MODE, DEVICE, MODEL_ZOO, VALID_CALIB_MODES, YOLO_WEIGHTS
 from .predictor import LoadedPredictor
 from .roi import (
     YoloRoiConfig,
@@ -33,10 +33,18 @@ def get_yolo() -> YOLO | None:
     return _load_yolo(str(YOLO_WEIGHTS))
 
 
-@lru_cache(maxsize=16)
-def get_predictor(model_key: str) -> LoadedPredictor:
+def normalize_calib_mode(calib_mode: str) -> str:
+    mode = (calib_mode or CALIB_MODE).lower().strip()
+    if mode not in VALID_CALIB_MODES:
+        raise ValueError(mode)
+    return mode
+
+
+@lru_cache(maxsize=32)
+def get_predictor(model_key: str, calib_mode: str) -> LoadedPredictor:
     if model_key not in MODEL_ZOO:
         raise KeyError(model_key)
+    calib_mode = normalize_calib_mode(calib_mode)
     spec = MODEL_ZOO[model_key]
     ckpt_path = spec.ckpt_path()
     meta_path = spec.meta_path()
@@ -48,7 +56,7 @@ def get_predictor(model_key: str) -> LoadedPredictor:
         ckpt_path=ckpt_path,
         meta_path=meta_path,
         device=DEVICE,
-        calib_mode=CALIB_MODE,
+        calib_mode=calib_mode,
     )
 
 
@@ -56,6 +64,7 @@ def get_predictor(model_key: str) -> LoadedPredictor:
 def list_models():
     return ModelsResponse(
         available_models=sorted(list(MODEL_ZOO.keys())),
+        available_calib_modes=list(VALID_CALIB_MODES),
         yolo_weights=str(YOLO_WEIGHTS),
         device=DEVICE,
         calib_mode=CALIB_MODE,
@@ -71,11 +80,17 @@ def health():
 async def predict(
     model: str = Query(..., description="Tên model, ví dụ: convnext10k"),
     roi_mode: str = Query("auto", description="auto|yolo|green|center"),
+    calib_mode: str = Query(CALIB_MODE, description="greenborder|none"),
     debug: bool = Query(False, description="Trả raw probs/mu/logvar nếu true"),
     file: UploadFile = File(...),
 ):
     if model not in MODEL_ZOO:
         raise HTTPException(status_code=400, detail=f"Model không hợp lệ: {model}. Xem /models")
+    try:
+        calib_mode = normalize_calib_mode(calib_mode)
+    except ValueError:
+        valid = "|".join(VALID_CALIB_MODES)
+        raise HTTPException(status_code=400, detail=f"calib_mode không hợp lệ: {calib_mode}. Dùng: {valid}")
 
     data = await file.read()
     arr = np.frombuffer(data, dtype=np.uint8)
@@ -107,7 +122,7 @@ async def predict(
 
     # 2) Predict
     try:
-        pred = get_predictor(model).predict(roi_bgr)
+        pred = get_predictor(model, calib_mode).predict(roi_bgr)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Inference error: {e}")
 
@@ -116,7 +131,7 @@ async def predict(
         predicted_chemical=pred.chemical,
         chemical_confidence=pred.chemical_conf,
         concentration=RegressionInfo(ppm=pred.ppm, ppm_ci95=pred.ppm_ci95, ppm_sigma=pred.ppm_sigma),
-        calib_mode=CALIB_MODE,
+        calib_mode=calib_mode,
         roi=RoiInfo(source=source, bbox_xyxy=bbox, padding=padding, imgsz=imgsz),
         raw=pred.raw if debug else None,
     )
