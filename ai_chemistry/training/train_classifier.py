@@ -166,13 +166,138 @@ def make_transforms(image_size=224, train=True):
         ])
 
 # ================= Dataset =================
+SPLIT_NAMES = ('train', 'val', 'test')
+REQUIRED_LABEL_COLUMNS = {'path', 'chemical', 'ppm'}
+
+
+def _normalise_label_path(path_value):
+    """Return a safe, platform-native relative path from a CSV path value."""
+    raw_path = str(path_value).strip().replace('\\', '/')
+    parts = [part for part in raw_path.split('/') if part not in ('', '.')]
+    if not parts or '..' in parts or Path(raw_path).is_absolute():
+        raise ValueError(f"Invalid relative image path in labels: {path_value!r}")
+    return Path(*parts)
+
+
+def _prepare_split_frame(df, split_name, csv_path):
+    missing_columns = REQUIRED_LABEL_COLUMNS.difference(df.columns)
+    if missing_columns:
+        missing = ', '.join(sorted(missing_columns))
+        raise ValueError(f"{csv_path} is missing required columns: {missing}")
+    if df.empty:
+        raise ValueError(f"{csv_path} contains no rows.")
+
+    frame = df.copy()
+    if 'split' in frame.columns:
+        declared = frame['split'].astype(str).str.strip().str.lower()
+        mismatched = declared.ne(split_name)
+        if mismatched.any():
+            values = sorted(declared[mismatched].unique().tolist())
+            raise ValueError(
+                f"{csv_path} is the {split_name} CSV but contains split values: {values}"
+            )
+    frame['split'] = split_name
+
+    frame['chemical'] = frame['chemical'].astype(str).str.strip().str.upper()
+    invalid_chemicals = sorted(set(frame['chemical']) - {'NH4', 'NO2'})
+    if invalid_chemicals:
+        raise ValueError(f"{csv_path} contains unsupported chemicals: {invalid_chemicals}")
+
+    frame['ppm'] = pd.to_numeric(frame['ppm'], errors='coerce')
+    invalid_ppm = frame['ppm'].isna() | ~np.isfinite(frame['ppm']) | (frame['ppm'] < 0)
+    if invalid_ppm.any():
+        raise ValueError(f"{csv_path} contains {int(invalid_ppm.sum())} invalid ppm values.")
+
+    # Validate path syntax here; file existence is checked after all splits are loaded.
+    frame['path'].map(_normalise_label_path)
+    return frame.reset_index(drop=True)
+
+
+def load_training_splits(args):
+    """
+    Load either the submission layout (preferred) or one legacy combined CSV.
+
+    Submission layout:
+      <submission_dir>/raw/<dataset>/...
+      <submission_dir>/labels/<dataset>/{train,val,test}.csv
+    """
+    if args.labels_csv:
+        if not args.root_dir:
+            raise ValueError("--root_dir is required when using legacy --labels_csv.")
+        images_root = Path(args.root_dir).expanduser()
+        labels_csv = Path(args.labels_csv).expanduser()
+        if not labels_csv.is_file():
+            raise FileNotFoundError(f"Labels CSV not found: {labels_csv}")
+        labels = pd.read_csv(labels_csv)
+        if 'split' not in labels.columns:
+            raise ValueError(f"Legacy labels CSV must contain a split column: {labels_csv}")
+        split_frames = {
+            split: _prepare_split_frame(
+                labels[labels['split'].astype(str).str.strip().str.lower() == split],
+                split,
+                labels_csv,
+            )
+            for split in SPLIT_NAMES
+        }
+        data_description = f"legacy CSV {labels_csv}"
+    else:
+        submission_dir = Path(args.submission_dir).expanduser()
+        images_root = (
+            Path(args.root_dir).expanduser()
+            if args.root_dir
+            else submission_dir / 'raw' / args.dataset
+        )
+        labels_dir = (
+            Path(args.labels_dir).expanduser()
+            if args.labels_dir
+            else submission_dir / 'labels' / args.dataset
+        )
+        split_frames = {}
+        for split in SPLIT_NAMES:
+            csv_path = labels_dir / f'{split}.csv'
+            if not csv_path.is_file():
+                raise FileNotFoundError(f"Missing {split} labels CSV: {csv_path}")
+            split_frames[split] = _prepare_split_frame(
+                pd.read_csv(csv_path), split, csv_path
+            )
+        data_description = f"submission dataset '{args.dataset}' at {submission_dir}"
+
+    if not images_root.is_dir():
+        raise FileNotFoundError(f"Images root not found: {images_root}")
+    images_root = images_root.resolve()
+
+    all_frames = pd.concat(split_frames.values(), ignore_index=True)
+    canonical_paths = all_frames['path'].astype(str).str.replace('\\', '/', regex=False).str.lower()
+    duplicated = canonical_paths.duplicated(keep=False)
+    if duplicated.any():
+        examples = all_frames.loc[duplicated, 'path'].head(5).tolist()
+        raise ValueError(f"Duplicate image paths across label splits: {examples}")
+
+    missing_images = []
+    for relative_path in all_frames['path']:
+        image_path = images_root / _normalise_label_path(relative_path)
+        if not image_path.is_file():
+            missing_images.append(str(image_path))
+            if len(missing_images) == 5:
+                break
+    if missing_images:
+        raise FileNotFoundError(
+            "Label paths do not resolve under the images root. First missing files: "
+            + '; '.join(missing_images)
+        )
+
+    logging.info("Loaded %s", data_description)
+    logging.info("Images root: %s", images_root)
+    return images_root, split_frames['train'], split_frames['val'], split_frames['test']
+
+
 class ChemistryDataset(Dataset):
     """
-    labels_csv yêu cầu các cột:
+    DataFrame nhãn yêu cầu các cột:
       - path (relative to root_dir)
       - chemical ('NH4'/'NO2')
       - ppm (float)
-      - split ('train'/'val'/'test')
+    Các cột device, datetime và split được giữ làm metadata nếu có.
     """
     def __init__(self, df, root_dir, chemical_encoder,
                  ppm_scale='log1p', ppm_min=None, ppm_max=None,
@@ -390,17 +515,13 @@ def evaluate(model, loader, device, ppm_scale, ppm_min, ppm_max, prefix="Eval"):
 def train(args):
     set_seed(args.seed)
 
-    labels = pd.read_csv(args.labels_csv)
-    labels = labels[labels['chemical'].isin(['NH4','NO2'])].copy()
-    assert len(labels) > 0, "labels.csv không có mẫu NH4/NO2!"
-
-    train_df = labels[labels['split']=='train'].reset_index(drop=True)
-    val_df   = labels[labels['split']=='val'].reset_index(drop=True)
-    test_df  = labels[labels['split']=='test'].reset_index(drop=True)
+    images_root, train_df, val_df, test_df = load_training_splits(args)
 
     # label encoding: giữ thứ tự nhất quán theo train
     le = LabelEncoder().fit(train_df['chemical'])
     classes = list(le.classes_)  # thường: ['NH4','NO2']
+    if classes != ['NH4', 'NO2']:
+        raise ValueError(f"Training split must contain both NH4 and NO2; found: {classes}")
     num_classes = len(classes)
 
     # minmax scale (nếu dùng) phải dựa trên train_df
@@ -414,13 +535,13 @@ def train(args):
     t_train = make_transforms(args.image_size, train=True)
     t_eval  = make_transforms(args.image_size, train=False)
 
-    train_ds = ChemistryDataset(train_df, args.root_dir, le,
+    train_ds = ChemistryDataset(train_df, images_root, le,
                                 ppm_scale=args.ppm_scale, ppm_min=ppm_min, ppm_max=ppm_max,
                                 transform=t_train, gnorm=gnorm)
-    val_ds   = ChemistryDataset(val_df,   args.root_dir, le,
+    val_ds   = ChemistryDataset(val_df,   images_root, le,
                                 ppm_scale=args.ppm_scale, ppm_min=ppm_min, ppm_max=ppm_max,
                                 transform=t_eval, gnorm=gnorm)
-    test_ds  = ChemistryDataset(test_df,  args.root_dir, le,
+    test_ds  = ChemistryDataset(test_df,  images_root, le,
                                 ppm_scale=args.ppm_scale, ppm_min=ppm_min, ppm_max=ppm_max,
                                 transform=t_eval, gnorm=gnorm)
 
@@ -434,6 +555,10 @@ def train(args):
     logging.info(f"Train/Val/Test sizes: {len(train_ds)}/{len(val_ds)}/{len(test_ds)}")
     logging.info(f"Classes (label encoder order): {classes}")
     logging.info(f"Calibration mode: {args.calib}")
+
+    if args.validate_only:
+        logging.info("Dataset validation completed; training skipped (--validate_only).")
+        return
 
     model = MultiTaskHetero(
         timm_name=args.timm_name, num_classes=num_classes,
@@ -599,8 +724,18 @@ def train(args):
 def parse_args():
     ap = argparse.ArgumentParser("Train NH4/NO2 two-heads heteroscedastic + calibration ablation")
     # data
-    ap.add_argument('--root_dir',   type=str, default='data_clsreg/images')
-    ap.add_argument('--labels_csv', type=str, default='data_clsreg/labels.csv')
+    ap.add_argument('--submission_dir', type=str, default='data/submission',
+                    help="Root containing raw/<dataset> and labels/<dataset>.")
+    ap.add_argument('--dataset', type=str, default='13k', choices=['10k', '3k', '13k'],
+                    help="Dataset package to train on inside --submission_dir.")
+    ap.add_argument('--root_dir', type=str, default=None,
+                    help="Optional image-root override; required with legacy --labels_csv.")
+    ap.add_argument('--labels_dir', type=str, default=None,
+                    help="Optional directory containing train.csv, val.csv and test.csv.")
+    ap.add_argument('--labels_csv', type=str, default=None,
+                    help="Legacy combined CSV with a split column.")
+    ap.add_argument('--validate_only', action='store_true',
+                    help="Validate images and all three split CSVs, then exit without training.")
     ap.add_argument('--image_size', type=int, default=224)
     ap.add_argument('--batch_size', type=int, default=32)
     ap.add_argument('--num_workers', type=int, default=2)
@@ -643,5 +778,6 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
+    if not args.validate_only:
+        os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
     train(args)
