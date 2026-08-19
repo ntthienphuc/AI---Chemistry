@@ -155,61 +155,40 @@ Raw full-resolution colorimetric strip images are hosted on Google Drive:
 
 ## 🧠 Neural Network Architectures & Vision Backbones
 
-All multi-task models share the canonical **MLP2** task head topology:
-$$\text{Head}(x) = \text{Linear}(d, 512) \to \text{ReLU} \to \text{Dropout}(0.3) \to \text{Linear}(512, \text{out\_dim})$$
-
-| Model ID | Vision Backbone (`timm` Identifier) | Backbone Params | Head Input Dim ($d$) | Total Model Params | Default Resolution |
-| :--- | :--- | :---: | :---: | :---: | :---: |
-| `mnv3` | `mobilenetv3_large_100.ra_in1k` | 5.4 M | **1280** | **6.20 M** | $224 \times 224$ |
-| `effb0` | `efficientnet_b0.ra_in1k` | 5.3 M | **1280** | **6.02 M** | $224 \times 224$ |
-| `nfnet` | `dm_nfnet_f2.dm_in1k` / `dm_nfnet_f0.dm_in1k` | 193.8 M / 71.5 M | **3072** | **195.43 M / 73.14 M** | $224 \times 224$ |
-| `tfb3` | `tf_efficientnet_b3.ns_jft_in1k` | 12.0 M | **1536** | **13.15 M** | $224 \times 224$ |
-| `convnext` | `convnext_tiny.fb_in1k` / `convnext_base.fb_in1k` | 28.6 M / 88.6 M | **768 / 1024** | **29.00 M / 89.14 M** | $224 \times 224$ |
-| `swint` | `swin_tiny_patch4_window7_224.ms_in1k` | 28.3 M | **768** | **28.70 M** | $224 \times 224$ |
-
-### Loss Formulation
-Multi-task loss with heteroscedastic aleatoric uncertainty:
-$$\mathcal{L}_{\text{total}} = \lambda_{\text{cls}} \mathcal{L}_{\text{CE}}(\hat{y}_{\text{cls}}, y_{\text{cls}}) + \lambda_{\text{reg}} \frac{1}{2} \left[ \exp(-\hat{s}) (\hat{\mu} - y_{\text{reg}})^2 + \hat{s} \right]$$
-where $\hat{s} = \log \hat{\sigma}^2$, $\lambda_{\text{cls}} = 1.0$, and $\lambda_{\text{reg}} = 2.0$.
+| Backbone Label | Exact `timm` Identifier | Family | Approx. Pretrained Parameters (M) |
+| :--- | :--- | :--- | :---: |
+| **MobileNetV3-Large** | `mobilenetv3_large_100.ra_in1k` | CNN | 5.5 |
+| **EfficientNet-B0** | `efficientnet_b0.ra_in1k` | CNN | 5.3 |
+| **DM-NFNet-F2** | `dm_nfnet_f2.dm_in1k` | CNN | 193.8 |
+| **TF-EfficientNet-B3** | `tf_efficientnet_b3.ns_jft_in1k` | CNN | 12.2 |
+| **ConvNeXt-Tiny** | `convnext_tiny.fb_in1k` | CNN | 28.6 |
+| **Swin-Tiny** | `swin_tiny_patch4_window7_224.ms_in1k` | Transformer | 28.3 |
 
 ---
 
-## ⚙️ Locked Training Protocol
+## ⚙️ S3.6. Model Training and Inference
 
-| Hyperparameter | Value | Description |
-| :--- | :--- | :--- |
-| **Total Epochs** | `60` | Fixed total budget (warmup included) |
-| **Warmup Epochs** | `5` | Initial epochs with frozen backbone |
-| **Batch Size** | `32` | Mini-batch dimension |
-| **Optimizer** | `AdamW` | Base $\text{LR} = 2 \times 10^{-4}$, Weight Decay = $10^{-4}$ |
-| **LR Schedule** | Cosine Annealing | Half-cycle cosine decay to zero |
-| **Label Smoothing** | `0.05` | Cross-entropy regularization |
-| **Dropout / DropPath** | `0.2 / 0.1` | Regularization rates |
-| **Gradient Clipping** | `1.0` | Max norm gradient threshold |
-| **Selection Score** | $(1 - \text{Acc}) + 2 \times \text{MAE}$ | Unsmoothed validation selection |
-| **Early Stopping** | `10` | Validation score patience |
-| **Random Seed** | `0` | Deterministic initialization |
+### S3.6.1. Training Configuration
 
-### Reproduce One Reported Training Run
-```bash
-python -m ai_chemistry.training.train_classifier \
-  --dataset 13k \
-  --timm_name mobilenetv3_large_100.ra_in1k \
-  --image_size 224 \
-  --epochs 60 \
-  --warmup_epochs 5 \
-  --lr 2e-4 \
-  --loss_weight_cls 1.0 \
-  --loss_weight_reg 2.0 \
-  --label_smoothing 0.05 \
-  --drop 0.2 \
-  --drop_path 0.1 \
-  --grad_clip 1.0 \
-  --patience 10 \
-  --seed 0 \
-  --calib_mode none \
-  --save_ckpt weights/runs_multitask_13k/MNV3_seed0_l2.0_none.pt
-```
+All backbone architectures were trained using a common multi-task optimization protocol to ensure fair comparison across network architectures. Unless otherwise stated, all models used $224 \times 224$ inputs and were trained for a maximum of 60 total epochs with AdamW (initial learning rate $2 \times 10^{-4}$; weight decay $1 \times 10^{-4}$). The backbone was frozen during the first five epochs and unfrozen thereafter for up to 55 additional epochs. Cosine LambdaLR scheduling was used, with the optimizer and scheduler reinitialized when the backbone was unfrozen. Mixed-precision training was enabled when CUDA was available, and gradient clipping was applied to improve numerical stability.
+
+Training employed two analyte-specific heteroscedastic regression heads together with one classification head. Concentration targets were transformed using the `log1p` function, and the overall objective combined classification and regression losses with weighting factors of 1.0 and 2.0, respectively. Best-checkpoint selection used the validation score $(1 - \text{accuracy}) + 2 \times \text{MAE}$ with an early-stopping patience of 10 epochs. The reported model-comparison results correspond to seed 0. The complete training configuration is summarized in Table S6.
+
+### Table S6. Training Parameters Used for All Backbone Architectures
+
+| Parameter | Locked Specification |
+| :--- | :--- |
+| **Input and Normalization** | $224 \times 224$ RGB ROI; ImageNet mean and standard deviation |
+| **Optimizer** | AdamW; initial learning rate = $2 \times 10^{-4}$; weight decay = $1 \times 10^{-4}$ |
+| **Warm-up** | 5 epochs; backbone frozen |
+| **Fine-tuning** | Up to 55 additional epochs; full network unfrozen |
+| **Maximum Total Epochs** | 60 total (5 warm-up + up to 55 fine-tuning) |
+| **Learning-rate Schedule** | Cosine LambdaLR; optimizer/scheduler reinitialized when the backbone is unfrozen |
+| **Model Selection** | Validation score: $(1 - \text{accuracy}) + 2 \times \text{MAE}$; patience = 10 |
+| **Classification Objective** | Cross-entropy with label smoothing = 0.05; weight = 1.0 |
+| **Regression Objective** | Heteroscedastic Gaussian NLL in `log1p` space; weight = 2.0 |
+| **Stability** | Mixed precision on CUDA; gradient clip = 1.0; no EMA |
+| **Repetition** | Seed 0 only; one reported run per dataset/backbone/preprocessing configuration |
 
 ---
 

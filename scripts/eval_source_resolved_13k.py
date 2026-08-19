@@ -97,7 +97,7 @@ def main():
 
         for comp_name, comp_manifest in components:
             print(f"\n==================================================")
-            print(f"Evaluating 13K Models on {comp_name}")
+            print(f"Evaluating 13K Models on {comp_name} ({comp_manifest.name})")
             print(f"==================================================")
 
             for bb in BACKBONES:
@@ -112,21 +112,17 @@ def main():
                     out_csv = out_root / f"{bb}_13k_{calib}_{comp_name}_preds.csv"
                     calib_arg = "none" if calib == "none" else "greenborder"
 
-                    # Run test_classifier with custom manifest
+                    # Run test_classifier with custom manifest_csv!
                     cmd = [
                         sys.executable,
                         "-m",
                         "ai_chemistry.training.test_classifier",
                         "--ckpt_path",
                         str(ckpt_path),
-                        "--dataset",
-                        "13k",
-                        "--manifests_dir",
-                        str(manifests_root),
+                        "--manifest_csv",
+                        str(comp_manifest),
                         "--images_root",
                         args.images_root,
-                        "--split",
-                        "test",
                         "--calib",
                         calib_arg,
                         "--device",

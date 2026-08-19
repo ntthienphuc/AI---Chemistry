@@ -9,8 +9,9 @@ Verifies:
 3. Task-head input feature dimension (feat_dim).
 4. Total parameter count and tensor numel.
 5. Strict state_dict loadability into MultiTaskHeteroFlexible.
-6. Checkpoint SHA-256 cryptographic checksums.
-7. Outputs an updated, verified checkpoints_manifest.csv.
+6. Calibration mode provenance matching filename.
+7. Checkpoint SHA-256 cryptographic checksums.
+8. Outputs an updated, verified checkpoints_manifest.csv.
 """
 
 from __future__ import annotations
@@ -70,7 +71,7 @@ def audit_checkpoint(ckpt_path: Path) -> Dict:
         with open(meta_path, "r", encoding="utf-8") as f:
             meta_json = json.load(f)
 
-    meta = build_meta_from_ckpt({**ckpt, **meta_json})
+    meta = build_meta_from_ckpt({**ckpt, **meta_json}, ckpt_path=ckpt_path)
     timm_name = meta_json.get("timm_name", ckpt.get("timm_name", meta.timm_name))
 
     # 3. Analyze architecture
@@ -99,6 +100,15 @@ def audit_checkpoint(ckpt_path: Path) -> Dict:
     except Exception as e:
         error_msg = str(e)
 
+    # 5. Provenance validation
+    calib_train = meta.calib_mode_train
+    if "_green" in ckpt_path.name.lower() and calib_train != "greenborder":
+        error_msg = f"Provenance mismatch: filename has '_green' but calib_mode_train is '{calib_train}'"
+        strict_load_ok = False
+    elif "_none" in ckpt_path.name.lower() and calib_train != "none":
+        error_msg = f"Provenance mismatch: filename has '_none' but calib_mode_train is '{calib_train}'"
+        strict_load_ok = False
+
     # Identify parent dataset folder if available
     parent_folder = ckpt_path.parent.name
 
@@ -109,7 +119,7 @@ def audit_checkpoint(ckpt_path: Path) -> Dict:
         "head_in_dim": head_in,
         "head_variant": head_variant,
         "timm_name": timm_name,
-        "calib_train": meta.calib_mode_train,
+        "calib_train": calib_train,
         "seed": meta.seed,
         "loss_weight_reg": meta.loss_weight_reg,
         "strict_load_ok": strict_load_ok,
@@ -173,7 +183,7 @@ def main():
             failed.append((pt.name, res["error"]))
         print(
             f"  [{status:<6}] {res['file']:<45} | {res['timm_name']:<38} | "
-            f"Params: {res['total_params_M']}M | Dim: {res['head_in_dim']} | Head: {res['head_variant']}"
+            f"Calib: {res['calib_train']:<11} | Params: {res['total_params_M']}M | Dim: {res['head_in_dim']}"
         )
 
     df = pd.DataFrame(results)
@@ -183,11 +193,11 @@ def main():
     print(f"\nSaved updated manifest: {out_csv}")
 
     if failed:
-        print(f"\nWARNING: {len(failed)} checkpoints failed strict loading:")
+        print(f"\nWARNING: {len(failed)} checkpoints failed audit:")
         for name, err in failed:
             print(f"  - {name}: {err}")
     else:
-        print("\nALL CHECKPOINTS AUDITED AND STRICT LOAD VERIFIED SUCCESSFULLY.")
+        print("\nALL CHECKPOINTS AUDITED AND PROVENANCE STRICT LOAD VERIFIED SUCCESSFULLY.")
 
 
 if __name__ == "__main__":

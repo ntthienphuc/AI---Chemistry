@@ -80,80 +80,87 @@ def evaluate_dataset(
     y_reg_pred_raw: List[float] = []
     y_reg_logvar: List[Optional[float]] = []
 
+    analyte_true_names: List[str] = []
+    analyte_pred_names: List[str] = []
+
     with torch.no_grad():
-        for images, chem_indices, ppm_scaled, paths in tqdm(loader, desc="Evaluating", leave=False):
-            images = images.to(device, non_blocking=True)
-            chem_indices = chem_indices.to(device, non_blocking=True)
-            ppm_scaled = ppm_scaled.to(device, non_blocking=True).float()
+        for batch in tqdm(loader, desc="Evaluating", leave=False):
+            images = batch["image"].to(device)
+            cls_targets = batch["chemical_idx"].numpy()
+            reg_targets = batch["ppm_raw"].numpy()
+            paths = batch["path"]
 
-            logits, reg_NH4, reg_NO2, _ = model(images)
+            logits, reg_nh4, reg_no2 = model(images)
 
-            probs = F.softmax(logits, dim=1)
-            pred_cls = logits.argmax(dim=1)
+            probs = F.softmax(logits, dim=1).cpu().numpy()
+            preds_cls = probs.argmax(axis=1)
 
-            mu_NH4 = reg_NH4[:, 0]
-            mu_NO2 = reg_NO2[:, 0]
-            mu_heads = torch.stack([mu_NH4, mu_NO2], dim=1)
-            pred_reg_scaled = mu_heads.gather(1, pred_cls.view(-1, 1)).squeeze(1)
+            reg_nh4_np = reg_nh4.cpu().numpy()
+            reg_no2_np = reg_no2.cpu().numpy()
 
-            lv_heads = None
-            if reg_NH4.shape[1] >= 2 and reg_NO2.shape[1] >= 2:
-                lv_heads = torch.stack([reg_NH4[:, 1], reg_NO2[:, 1]], dim=1)
-                pred_lv = lv_heads.gather(1, pred_cls.view(-1, 1)).squeeze(1)
-                y_reg_logvar.extend(pred_lv.cpu().numpy().tolist())
-            else:
-                y_reg_logvar.extend([None] * len(images))
+            for i in range(len(cls_targets)):
+                c_true = int(cls_targets[i])
+                c_pred = int(preds_cls[i])
+                p_vec = probs[i].tolist()
 
-            sample_paths.extend(paths)
-            y_cls_true.extend(chem_indices.cpu().numpy().tolist())
-            y_cls_pred.extend(pred_cls.cpu().numpy().tolist())
-            y_cls_probs.extend(probs.cpu().numpy().tolist())
+                sample_paths.append(str(paths[i]))
+                y_cls_true.append(c_true)
+                y_cls_pred.append(c_pred)
+                y_cls_probs.append(p_vec)
 
-            y_reg_true_raw.extend(ppm_scaled.cpu().numpy().tolist())
-            y_reg_pred_raw.extend(pred_reg_scaled.cpu().numpy().tolist())
+                true_chem = classes[c_true] if c_true < len(classes) else "Unknown"
+                pred_chem = classes[c_pred] if c_pred < len(classes) else "Unknown"
+                analyte_true_names.append(true_chem)
+                analyte_pred_names.append(pred_chem)
 
-    y_t_cls = np.array(y_cls_true)
-    y_p_cls = np.array(y_cls_pred)
+                # Route regression head based on PREDICTED analyte
+                if pred_chem.upper().startswith("NH4"):
+                    reg_out = reg_nh4_np[i]
+                else:
+                    reg_out = reg_no2_np[i]
 
-    y_t_ppm = np.array([inverse_scale_ppm(v, ppm_scale, ppm_min, ppm_max) for v in y_reg_true_raw])
-    y_p_ppm = np.clip(
-        np.array([inverse_scale_ppm(v, ppm_scale, ppm_min, ppm_max) for v in y_reg_pred_raw]), 0.0, np.inf
-    )
+                mu_scaled = float(reg_out[0])
+                lv_scaled = float(reg_out[1]) if reg_out.shape[0] >= 2 else None
 
-    # Classification Metrics
-    acc = float(accuracy_score(y_t_cls, y_p_cls))
-    f1_macro = float(f1_score(y_t_cls, y_p_cls, average="macro", zero_division=0))
-    f1_weighted = float(f1_score(y_t_cls, y_p_cls, average="weighted", zero_division=0))
-    cm = confusion_matrix(y_t_cls, y_p_cls).tolist()
+                ppm_pred = inverse_scale_ppm(mu_scaled, ppm_scale, ppm_min, ppm_max)
+                ppm_pred = max(0.0, float(ppm_pred))
 
-    # Regression Metrics (Overall)
-    mae = float(mean_absolute_error(y_t_ppm, y_p_ppm))
-    rmse = float(np.sqrt(mean_squared_error(y_t_ppm, y_p_ppm)))
-    r2 = float(r2_score(y_t_ppm, y_p_ppm)) if len(y_t_ppm) > 1 else 1.0
-    mape = float(safe_mape(y_t_ppm, y_p_ppm))
+                y_reg_true_raw.append(float(reg_targets[i]))
+                y_reg_pred_raw.append(ppm_pred)
+                y_reg_logvar.append(lv_scaled)
+
+    # Compute Classification Metrics
+    acc = float(accuracy_score(y_cls_true, y_cls_pred))
+    macro_f1 = float(f1_score(y_cls_true, y_cls_pred, average="macro", zero_division=0))
+    weighted_f1 = float(f1_score(y_cls_true, y_cls_pred, average="weighted", zero_division=0))
+    cm = confusion_matrix(y_cls_true, y_cls_pred).tolist()
+
+    # Compute End-to-End Regression Metrics
+    mae = float(mean_absolute_error(y_reg_true_raw, y_reg_pred_raw))
+    rmse = float(math.sqrt(mean_squared_error(y_reg_true_raw, y_reg_pred_raw)))
+    r2 = float(r2_score(y_reg_true_raw, y_reg_pred_raw))
+    mape = safe_mape(y_reg_true_raw, y_reg_pred_raw)
 
     # Per-analyte breakdown
-    per_analyte: Dict[str, Any] = {}
-    for idx, cname in enumerate(classes):
-        mask = y_t_cls == idx
-        if np.any(mask):
-            sub_t = y_t_ppm[mask]
-            sub_p = y_p_ppm[mask]
-            per_analyte[cname] = {
-                "count": int(np.sum(mask)),
-                "mae": float(mean_absolute_error(sub_t, sub_p)),
-                "rmse": float(np.sqrt(mean_squared_error(sub_t, sub_p))),
-                "r2": float(r2_score(sub_t, sub_p)) if len(sub_t) > 1 else 1.0,
-                "mape": float(safe_mape(sub_t, sub_p)),
+    per_analyte: Dict[str, Dict[str, float]] = {}
+    for c_idx, c_name in enumerate(classes):
+        mask = [t == c_idx for t in y_cls_true]
+        if any(mask):
+            y_t_sub = [y_reg_true_raw[j] for j, m in enumerate(mask) if m]
+            y_p_sub = [y_reg_pred_raw[j] for j, m in enumerate(mask) if m]
+            per_analyte[c_name] = {
+                "count": int(sum(mask)),
+                "mae": float(mean_absolute_error(y_t_sub, y_p_sub)),
+                "rmse": float(math.sqrt(mean_squared_error(y_t_sub, y_p_sub))),
+                "r2": float(r2_score(y_t_sub, y_p_sub)) if len(y_t_sub) > 1 else 0.0,
+                "mape": safe_mape(y_t_sub, y_p_sub),
             }
-        else:
-            per_analyte[cname] = None
 
-    metrics = {
+    metrics: Dict[str, Any] = {
         "classification": {
             "accuracy": acc,
-            "f1_macro": f1_macro,
-            "f1_weighted": f1_weighted,
+            "f1_macro": macro_f1,
+            "f1_weighted": weighted_f1,
             "confusion_matrix": cm,
         },
         "regression": {
@@ -163,25 +170,20 @@ def evaluate_dataset(
             "mape": mape,
             "per_analyte": per_analyte,
         },
-        "sample_count": len(sample_paths),
     }
 
-    # Build predictions dataframe
-    records = []
-    for i in range(len(sample_paths)):
-        records.append(
-            {
-                "path": sample_paths[i],
-                "true_chemical": classes[y_t_cls[i]] if y_t_cls[i] < len(classes) else str(y_t_cls[i]),
-                "pred_chemical": classes[y_p_cls[i]] if y_p_cls[i] < len(classes) else str(y_p_cls[i]),
-                "prob_NH4": float(y_cls_probs[i][0]),
-                "prob_NO2": float(y_cls_probs[i][1]) if len(y_cls_probs[i]) > 1 else 0.0,
-                "true_ppm": float(y_t_ppm[i]),
-                "pred_ppm": float(y_p_ppm[i]),
-                "logvar": float(y_reg_logvar[i]) if y_reg_logvar[i] is not None else None,
-            }
-        )
-    df_preds = pd.DataFrame(records)
+    df_preds = pd.DataFrame(
+        {
+            "path": sample_paths,
+            "chemical_true": analyte_true_names,
+            "chemical_pred": analyte_pred_names,
+            "ppm_true": y_reg_true_raw,
+            "ppm_pred": y_reg_pred_raw,
+            "logvar_scaled": y_reg_logvar,
+            "cls_probs": y_cls_probs,
+        }
+    )
+
     return metrics, df_preds
 
 
@@ -191,6 +193,7 @@ def main():
     parser.add_argument("--meta_path", type=str, default=None, help="Optional path to .meta.json sidecar.")
     parser.add_argument("--dataset", type=str, default="10k", choices=["3k", "10k", "13k"])
     parser.add_argument("--manifests_dir", type=str, default="data/manifests")
+    parser.add_argument("--manifest_csv", type=str, default=None, help="Optional path to specific CSV manifest.")
     parser.add_argument("--images_root", type=str, default="data")
     parser.add_argument("--split", type=str, default="test", choices=["test", "val", "train"])
     parser.add_argument("--calib", type=str, default="auto", help="auto | none | greenborder")
@@ -208,7 +211,7 @@ def main():
         raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
 
     # Load checkpoint & metadata
-    ckpt = torch.load(str(ckpt_path), map_location="cpu")
+    ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
     state = ckpt.get("state_dict", ckpt)
     if not isinstance(state, dict):
         raise RuntimeError(f"Invalid state dict in checkpoint: {ckpt_path}")
@@ -219,9 +222,9 @@ def main():
     if meta_path.is_file():
         with open(meta_path, "r", encoding="utf-8") as f:
             m = json.load(f)
-            meta = build_meta_from_ckpt({**ckpt, **m})
+            meta = build_meta_from_ckpt({**ckpt, **m}, ckpt_path=ckpt_path)
     else:
-        meta = build_meta_from_ckpt(ckpt)
+        meta = build_meta_from_ckpt(ckpt, ckpt_path=ckpt_path)
 
     # Resolve Calibration Mode
     train_calib = meta.calib_mode_train
@@ -276,11 +279,22 @@ def main():
     model.to(device).eval()
 
     # Load dataset
-    images_root, train_df, val_df, test_df = load_publication_splits(
-        args.manifests_dir, args.dataset, args.images_root
-    )
-    splits = {"train": train_df, "val": val_df, "test": test_df}
-    target_df = splits[args.split]
+    if args.manifest_csv:
+        manifest_p = Path(args.manifest_csv).resolve()
+        if not manifest_p.is_file():
+            raise FileNotFoundError(f"Custom manifest file not found: {manifest_p}")
+        target_df = prepare_split_frame(pd.read_csv(manifest_p))
+        images_root = Path(args.images_root).resolve()
+        dataset_name = f"custom_{manifest_p.stem}"
+        split_name = "custom"
+    else:
+        images_root, train_df, val_df, test_df = load_publication_splits(
+            args.manifests_dir, args.dataset, args.images_root
+        )
+        splits = {"train": train_df, "val": val_df, "test": test_df}
+        target_df = splits[args.split]
+        dataset_name = args.dataset
+        split_name = args.split
 
     class_to_idx = {c: i for i, c in enumerate(meta.classes)}
     normalizer = get_normalizer(eval_calib)
@@ -297,46 +311,40 @@ def main():
     )
 
     print("\n" + "=" * 60)
-    print(f"EVALUATION REPORT: {ckpt_path.stem} on {args.dataset.upper()} [{args.split.upper()}]")
+    print(f"EVALUATION REPORT: {ckpt_path.stem} on {dataset_name.upper()} [{split_name.upper()}]")
     print("=" * 60)
     cls_res = metrics["classification"]
     reg_res = metrics["regression"]
     print(f"Classification Accuracy : {cls_res['accuracy']*100:.2f}%")
     print(f"Classification Macro-F1 : {cls_res['f1_macro']:.4f}")
-    print(f"Regression Overall MAE  : {reg_res['mae']:.4f} ppm (mg/L)")
-    print(f"Regression Overall RMSE : {reg_res['rmse']:.4f} ppm (mg/L)")
-    print(f"Regression Overall R^2  : {reg_res['r2']:.4f}")
-    print(f"Regression Overall MAPE : {reg_res['mape']:.2f}%")
+    print(f"Regression MAE (ppm)    : {reg_res['mae']:.4f}")
+    print(f"Regression RMSE (ppm)   : {reg_res['rmse']:.4f}")
+    print(f"Regression R2 Score     : {reg_res['r2']:.4f}")
+    print(f"Regression MAPE (%)     : {reg_res['mape']:.2f}%")
     print("-" * 60)
-    for cname, pmetrics in reg_res["per_analyte"].items():
-        if pmetrics:
-            print(f"  [{cname:<3}] N={pmetrics['count']:<4} | MAE={pmetrics['mae']:.4f} | RMSE={pmetrics['rmse']:.4f} | R^2={pmetrics['r2']:.4f}")
-    print("=" * 60 + "\n")
 
-    # Export outputs
+    # Save Receipts
+    receipt = {
+        "checkpoint": str(ckpt_path.name),
+        "dataset": dataset_name,
+        "split": split_name,
+        "calib_train": train_calib,
+        "calib_eval": eval_calib,
+        "metrics": metrics,
+    }
+
     if args.output_json:
         out_j = Path(args.output_json).resolve()
         out_j.parent.mkdir(parents=True, exist_ok=True)
         with open(out_j, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "checkpoint": ckpt_path.name,
-                    "dataset": args.dataset,
-                    "split": args.split,
-                    "calib_train": train_calib,
-                    "calib_eval": eval_calib,
-                    "metrics": metrics,
-                },
-                f,
-                indent=2,
-            )
-        logger.info(f"Saved evaluation JSON receipt: {out_j}")
+            json.dump(receipt, f, indent=2)
+        print(f"Saved JSON Receipt: {out_j}")
 
     if args.predictions_csv:
         out_c = Path(args.predictions_csv).resolve()
         out_c.parent.mkdir(parents=True, exist_ok=True)
         df_preds.to_csv(out_c, index=False)
-        logger.info(f"Saved predictions CSV: {out_c}")
+        print(f"Saved Predictions CSV: {out_c}")
 
 
 if __name__ == "__main__":

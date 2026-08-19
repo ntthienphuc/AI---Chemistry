@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -75,237 +76,24 @@ def infer_head_variant(state: Dict[str, torch.Tensor]) -> str:
     return "mlp2"
 
 
-def infer_reg_out_dim(state: Dict[str, torch.Tensor]) -> int:
-    """Infer regression output dimension (2 for heteroscedastic mu+logvar, 1 for homoscedastic mu)."""
-    for cand in ("head_reg_NH4.3.weight", "head_reg_NH4.1.weight", "head_reg_NH4.weight"):
-        if cand in state:
-            return int(state[cand].shape[0])
-    return 2
-
-
 def infer_head_in_features(state: Dict[str, torch.Tensor]) -> Optional[int]:
-    """Infer input feature dimension expected by the first linear layer in the saved head."""
-    for cand in ("head_cls.0.weight", "head_cls.1.weight", "head_cls.weight"):
-        if cand in state:
-            return int(state[cand].shape[1])
+    """Infer feature dimension expected by the classification or regression head weights."""
+    for k in ["head_cls.0.weight", "head_cls.1.weight", "head_cls.weight", "head_reg_NH4.0.weight", "head_reg_NH4.1.weight"]:
+        if k in state and hasattr(state[k], "shape") and len(state[k].shape) >= 2:
+            return int(state[k].shape[1])
     return None
 
 
-def unwrap_output(y: Any) -> torch.Tensor:
-    """Unwrap backbone outputs that return tuple, list, or dict."""
-    if isinstance(y, (tuple, list)):
-        y = y[0]
-    if isinstance(y, dict):
-        y = y.get("x", next(iter(y.values())))
-    return y
+def infer_reg_out_dim(state: Dict[str, torch.Tensor]) -> int:
+    """Infer regression output dimension: 2 (heteroscedastic: mu, logvar) or 1 (homoscedastic: mu)."""
+    for k in ["head_reg_NH4.3.weight", "head_reg_NH4.1.weight", "head_reg_NH4.weight"]:
+        if k in state and hasattr(state[k], "shape") and len(state[k].shape) >= 1:
+            return int(state[k].shape[0])
+    return 2
 
 
-def infer_feat_dim(backbone: nn.Module, image_size: int = 224) -> int:
-    """
-    Robustly determine pre-logits feature dimension using a mock zero tensor forward pass.
-    Restores original train/eval state after probing.
-    """
-    was_training = backbone.training
-    backbone.eval()
-    with torch.no_grad():
-        x = torch.zeros(1, 3, image_size, image_size)
-        y = unwrap_output(backbone(x))
-        if y.ndim == 4:
-            y = y.mean(dim=(2, 3))
-        elif y.ndim != 2:
-            y = y.view(y.size(0), -1)
-        feat_dim = int(y.shape[1])
-    backbone.train(was_training)
-    return feat_dim
-
-
-class MultiTaskHetero(nn.Module):
-    """
-    Canonical Multi-Task Heteroscedastic Deep Neural Network for Smartphone Colorimetry.
-
-    Architecture:
-    - Backbone: Pretrained timm vision backbone (e.g. ConvNeXt, MobileNetV3, Swin, NFNet, EfficientNet)
-    - Head 1 (Classification): Linear(d, 512) -> ReLU -> Dropout(0.3) -> Linear(512, 2)
-    - Head 2 (NH4+ Regression): Linear(d, 512) -> ReLU -> Dropout(0.3) -> Linear(512, 2) [mu, log_var]
-    - Head 3 (NO2- Regression): Linear(d, 512) -> ReLU -> Dropout(0.3) -> Linear(512, 2) [mu, log_var]
-    """
-
-    def __init__(
-        self,
-        timm_name: str,
-        num_classes: int = 2,
-        pretrained: bool = True,
-        drop: float = 0.2,
-        drop_path: float = 0.1,
-        image_size: int = 224,
-        reg_out_dim: int = 2,
-        hidden_dim: int = 512,
-        head_dropout: float = 0.3,
-    ):
-        super().__init__()
-        self.timm_name = timm_name
-        self.num_classes = int(num_classes)
-        self.reg_out_dim = int(reg_out_dim)
-        self.image_size = int(image_size)
-
-        self.backbone = timm.create_model(
-            timm_name,
-            pretrained=pretrained,
-            num_classes=0,
-            drop_rate=drop,
-            drop_path_rate=drop_path,
-        )
-
-        self.feat_dim = infer_feat_dim(self.backbone, image_size=self.image_size)
-
-        # Canonical MLP2 Task Heads
-        self.head_cls = nn.Sequential(
-            nn.Linear(self.feat_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(head_dropout),
-            nn.Linear(hidden_dim, self.num_classes),
-        )
-
-        self.head_reg_NH4 = nn.Sequential(
-            nn.Linear(self.feat_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(head_dropout),
-            nn.Linear(hidden_dim, self.reg_out_dim),
-        )
-
-        self.head_reg_NO2 = nn.Sequential(
-            nn.Linear(self.feat_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(head_dropout),
-            nn.Linear(hidden_dim, self.reg_out_dim),
-        )
-
-    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        feats = unwrap_output(self.backbone(x))
-        if feats.ndim == 4:
-            feats = feats.mean(dim=(2, 3))
-        elif feats.ndim != 2:
-            feats = feats.view(feats.size(0), -1)
-        return feats
-
-    def forward(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        feats = self.extract_features(x)
-        logits = self.head_cls(feats)
-        reg_nh4 = self.head_reg_NH4(feats)
-        reg_no2 = self.head_reg_NO2(feats)
-        return logits, reg_nh4, reg_no2
-
-
-class MultiTaskHeteroFlexible(nn.Module):
-    """
-    Flexible multi-task model capable of loading both canonical MLP2 heads
-    and legacy single-layer linear heads for complete backward compatibility.
-    """
-
-    def __init__(
-        self,
-        timm_name: str,
-        num_classes: int = 2,
-        pretrained: bool = False,
-        drop: float = 0.2,
-        drop_path: float = 0.1,
-        image_size: int = 224,
-        head_variant: str = "mlp2",
-        reg_out_dim: int = 2,
-        expected_feat_dim: Optional[int] = None,
-        hidden_dim: int = 512,
-        head_dropout: float = 0.3,
-    ):
-        super().__init__()
-        self.timm_name = timm_name
-        self.num_classes = int(num_classes)
-        self.head_variant = head_variant
-        self.reg_out_dim = int(reg_out_dim)
-        self.image_size = int(image_size)
-        self.use_forward_head_features = False
-
-        self.backbone = timm.create_model(
-            timm_name,
-            pretrained=pretrained,
-            num_classes=0,
-            drop_rate=drop,
-            drop_path_rate=drop_path,
-        )
-
-        feat_dim = getattr(self.backbone, "num_features", None)
-        if feat_dim is None and hasattr(self.backbone, "feature_info"):
-            feat_dim = self.backbone.feature_info[-1]["num_chs"]
-        if feat_dim is None:
-            feat_dim = infer_feat_dim(self.backbone, image_size=self.image_size)
-
-        if expected_feat_dim is not None and int(expected_feat_dim) != int(feat_dim):
-            if hasattr(self.backbone, "forward_features") and hasattr(self.backbone, "forward_head"):
-                feat_dim = int(expected_feat_dim)
-                self.use_forward_head_features = True
-
-        self.feat_dim = int(feat_dim)
-
-        if self.head_variant == "linear":
-            self.head_cls = nn.Sequential(
-                nn.Dropout(p=head_dropout),
-                nn.Linear(self.feat_dim, self.num_classes),
-            )
-            self.head_reg_NH4 = nn.Sequential(
-                nn.Dropout(p=head_dropout),
-                nn.Linear(self.feat_dim, self.reg_out_dim),
-            )
-            self.head_reg_NO2 = nn.Sequential(
-                nn.Dropout(p=head_dropout),
-                nn.Linear(self.feat_dim, self.reg_out_dim),
-            )
-        else:
-            # Canonical MLP2
-            self.head_cls = nn.Sequential(
-                nn.Linear(self.feat_dim, hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Dropout(head_dropout),
-                nn.Linear(hidden_dim, self.num_classes),
-            )
-            self.head_reg_NH4 = nn.Sequential(
-                nn.Linear(self.feat_dim, hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Dropout(head_dropout),
-                nn.Linear(hidden_dim, self.reg_out_dim),
-            )
-            self.head_reg_NO2 = nn.Sequential(
-                nn.Linear(self.feat_dim, hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Dropout(head_dropout),
-                nn.Linear(hidden_dim, self.reg_out_dim),
-            )
-
-    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_forward_head_features:
-            feats = self.backbone.forward_features(x)
-            try:
-                return self.backbone.forward_head(feats, pre_logits=True)
-            except TypeError:
-                return self.backbone.forward_head(feats)
-
-        feats = unwrap_output(self.backbone(x))
-        if feats.ndim == 4:
-            feats = feats.mean(dim=(2, 3))
-        elif feats.ndim != 2:
-            feats = feats.view(feats.size(0), -1)
-        return feats
-
-    def forward(self, x: torch.Tensor):
-        feats = self.extract_features(x)
-        logits = self.head_cls(feats)
-        reg_nh4 = self.head_reg_NH4(feats)
-        reg_no2 = self.head_reg_NO2(feats)
-        return logits, reg_nh4, reg_no2, feats
-
-
-def build_meta_from_ckpt(ckpt: Dict[str, Any]) -> ModelMeta:
-    """Extract metadata dictionary or assign defaults from a loaded checkpoint."""
+def build_meta_from_ckpt(ckpt: Dict[str, Any], ckpt_path: Optional[Union[str, Path]] = None) -> ModelMeta:
+    """Extract metadata dictionary or assign defaults from a loaded checkpoint with provenance fallbacks."""
     timm_name = ckpt.get("timm_name", "convnext_tiny.fb_in1k")
     num_classes = int(ckpt.get("num_classes", 2))
     image_size = int(ckpt.get("image_size", 224))
@@ -315,7 +103,28 @@ def build_meta_from_ckpt(ckpt: Dict[str, Any]) -> ModelMeta:
     classes = tuple(ckpt.get("classes", ["NH4", "NO2"]))
     drop = float(ckpt.get("drop", 0.2))
     drop_path = float(ckpt.get("drop_path", 0.1))
-    calib_mode_train = str(ckpt.get("calib_mode_train", "none"))
+
+    # Robust calibration provenance extraction
+    raw_calib = (
+        ckpt.get("calib_mode_train")
+        or ckpt.get("calib_mode")
+        or ckpt.get("calib")
+        or ckpt.get("calibration")
+        or ckpt.get("train_calib")
+    )
+    if raw_calib is None and ckpt_path is not None:
+        p_str = str(ckpt_path).lower()
+        if "_green" in p_str:
+            raw_calib = "greenborder"
+        elif "_none" in p_str:
+            raw_calib = "none"
+
+    raw_calib_str = str(raw_calib or "none").lower().strip()
+    if raw_calib_str in {"green", "greenborder", "green_border"}:
+        calib_mode_train = "greenborder"
+    else:
+        calib_mode_train = "none"
+
     loss_weight_cls = float(ckpt.get("loss_weight_cls", 1.0))
     loss_weight_reg = float(ckpt.get("loss_weight_reg", 2.0))
     seed = int(ckpt.get("seed", 0))
@@ -335,3 +144,154 @@ def build_meta_from_ckpt(ckpt: Dict[str, Any]) -> ModelMeta:
         loss_weight_reg=loss_weight_reg,
         seed=seed,
     )
+
+
+def _infer_feat_dim(backbone: nn.Module, image_size: int = 224) -> int:
+    """Robustly infer feature dimension from a timm backbone via forward pass probing."""
+    try:
+        backbone.eval()
+        dummy = torch.zeros(1, 3, int(image_size), int(image_size))
+        with torch.no_grad():
+            feat = backbone(dummy)
+            if isinstance(feat, (tuple, list)):
+                feat = feat[-1]
+            if feat.ndim > 2:
+                feat = torch.flatten(feat, 1)
+            return int(feat.shape[1])
+    except Exception as e:
+        logger.debug(f"Forward probing error: {e}. Falling back to attribute inference.")
+
+    if hasattr(backbone, "num_features") and isinstance(backbone.num_features, int) and backbone.num_features > 0:
+        return backbone.num_features
+    if hasattr(backbone, "head_hidden_size") and isinstance(backbone.head_hidden_size, int) and backbone.head_hidden_size > 0:
+        return backbone.head_hidden_size
+
+    return 768
+
+
+infer_feat_dim = _infer_feat_dim
+
+
+def build_mlp2_head(in_features: int, out_features: int, drop: float = 0.3) -> nn.Sequential:
+    """
+    Canonical MLP2 Head: Linear(in, 512) -> ReLU -> Dropout(drop) -> Linear(512, out)
+    """
+    return nn.Sequential(
+        nn.Linear(in_features, 512),
+        nn.ReLU(inplace=True),
+        nn.Dropout(p=drop),
+        nn.Linear(512, out_features),
+    )
+
+
+def build_linear_head(in_features: int, out_features: int, drop: float = 0.2) -> nn.Sequential:
+    """
+    Legacy Linear Head: Dropout(drop) -> Linear(in, out)
+    """
+    return nn.Sequential(
+        nn.Dropout(p=drop),
+        nn.Linear(in_features, out_features),
+    )
+
+
+class MultiTaskHetero(nn.Module):
+    """
+    Canonical Multi-Task Heteroscedastic Neural Network.
+    Shared backbone + 3 canonical MLP2 task heads.
+    """
+
+    def __init__(
+        self,
+        timm_name: str = "convnext_tiny.fb_in1k",
+        num_classes: int = 2,
+        pretrained: bool = False,
+        drop: float = 0.2,
+        drop_path: float = 0.1,
+        image_size: int = 224,
+    ):
+        super().__init__()
+        self.timm_name = timm_name
+        self.num_classes = num_classes
+        self.image_size = image_size
+
+        kwargs: Dict[str, Any] = {"pretrained": pretrained, "num_classes": 0}
+        if drop > 0:
+            kwargs["drop_rate"] = drop
+        if drop_path > 0:
+            kwargs["drop_path_rate"] = drop_path
+
+        self.backbone = timm.create_model(timm_name, **kwargs)
+        self.feat_dim = _infer_feat_dim(self.backbone, image_size=image_size)
+
+        # Canonical MLP2 heads
+        self.head_cls = build_mlp2_head(self.feat_dim, num_classes, drop=0.3)
+        self.head_reg_NH4 = build_mlp2_head(self.feat_dim, 2, drop=0.3)
+        self.head_reg_NO2 = build_mlp2_head(self.feat_dim, 2, drop=0.3)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        feat = self.backbone(x)
+        if isinstance(feat, (tuple, list)):
+            feat = feat[-1]
+        if feat.ndim > 2:
+            feat = torch.flatten(feat, 1)
+
+        logits = self.head_cls(feat)
+        r_nh4 = self.head_reg_NH4(feat)
+        r_no2 = self.head_reg_NO2(feat)
+        return logits, r_nh4, r_no2
+
+
+class MultiTaskHeteroFlexible(nn.Module):
+    """
+    Adaptive loader supporting both canonical MLP2 heads and legacy Linear heads.
+    """
+
+    def __init__(
+        self,
+        timm_name: str,
+        num_classes: int = 2,
+        pretrained: bool = False,
+        drop: float = 0.2,
+        drop_path: float = 0.1,
+        image_size: int = 224,
+        head_variant: str = "mlp2",
+        reg_out_dim: int = 2,
+        expected_feat_dim: Optional[int] = None,
+    ):
+        super().__init__()
+        self.timm_name = timm_name
+        self.num_classes = num_classes
+        self.image_size = image_size
+        self.head_variant = head_variant
+        self.reg_out_dim = reg_out_dim
+
+        kwargs: Dict[str, Any] = {"pretrained": pretrained, "num_classes": 0}
+        if drop > 0:
+            kwargs["drop_rate"] = drop
+        if drop_path > 0:
+            kwargs["drop_path_rate"] = drop_path
+
+        self.backbone = timm.create_model(timm_name, **kwargs)
+        in_dim = expected_feat_dim if expected_feat_dim else _infer_feat_dim(self.backbone, image_size=image_size)
+        self.feat_dim = in_dim
+
+        if head_variant == "mlp2":
+            self.head_cls = build_mlp2_head(in_dim, num_classes, drop=0.3)
+            self.head_reg_NH4 = build_mlp2_head(in_dim, reg_out_dim, drop=0.3)
+            self.head_reg_NO2 = build_mlp2_head(in_dim, reg_out_dim, drop=0.3)
+        else:
+            self.head_cls = build_linear_head(in_dim, num_classes, drop=drop)
+            self.head_reg_NH4 = build_linear_head(in_dim, reg_out_dim, drop=drop)
+            self.head_reg_NO2 = build_linear_head(in_dim, reg_out_dim, drop=drop)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        feat = self.backbone(x)
+        if isinstance(feat, (tuple, list)):
+            feat = feat[-1]
+        if feat.ndim > 2:
+            feat = torch.flatten(feat, 1)
+
+        logits = self.head_cls(feat)
+        r_nh4 = self.head_reg_NH4(feat)
+        r_no2 = self.head_reg_NO2(feat)
+        return logits, r_nh4, r_no2
