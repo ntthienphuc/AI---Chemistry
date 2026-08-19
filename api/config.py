@@ -1,30 +1,31 @@
+﻿# -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
 
-
-# =========================
-# Fixed project configuration
-# =========================
-ROOT: Path = Path(r"D:\Project\AI - Chemistry")
+# =======================================================
+# Portable Project Configuration (Environment Overridable)
+# =======================================================
+DEFAULT_ROOT = Path(__file__).resolve().parents[1]
+ROOT: Path = Path(os.getenv("AI_CHEMISTRY_ROOT", str(DEFAULT_ROOT))).resolve()
 
 # YOLO ROI detector weights
-# Keep this path if your detector is still stored here.
-YOLO_WEIGHTS: Path = ROOT / "weights" / "best.pt"
+WEIGHTS_DIR: Path = Path(os.getenv("AI_CHEMISTRY_WEIGHTS", str(ROOT / "weights"))).resolve()
+YOLO_WEIGHTS: Path = Path(os.getenv("AI_CHEMISTRY_YOLO", str(WEIGHTS_DIR / "best.pt"))).resolve()
 
 # Inference device
-DEVICE: str = "cuda"
+DEVICE: str = os.getenv("AI_CHEMISTRY_DEVICE", "cuda")
 
 # Default calibration mode used by the app
-# - "greenborder" : use GreenBorderNormalizer
-# - "none"        : no calibration
 CALIB_MODE: str = "greenborder"
 VALID_CALIB_MODES = ("greenborder", "none")
 VALID_DATA_TYPES = ("3k", "10k", "13k")
 VALID_MODEL_TYPES = ("convnext", "effb0", "mnv3", "nfnet", "swint", "tfb3")
 VALID_TRAIN_CALIBS = ("green", "none")
+VALID_MODES = ("app", "paper", "diagnostic")
 
 
 @dataclass(frozen=True)
@@ -45,8 +46,8 @@ class ModelSpec:
 def _spec(name: str, folder: str, stem: str, suffix: str) -> ModelSpec:
     return ModelSpec(
         name=name,
-        ckpt_rel=fr"weights\{folder}\{stem}_{suffix}.pt",
-        meta_rel=fr"weights\{folder}\{stem}_{suffix}.meta.json",
+        ckpt_rel=str(Path("weights") / folder / f"{stem}_{suffix}.pt"),
+        meta_rel=str(Path("weights") / folder / f"{stem}_{suffix}.meta.json"),
     )
 
 
@@ -94,11 +95,8 @@ MODEL_ZOO_EXPLICIT: Dict[str, ModelSpec] = {
     "tfb313k_none": _spec("tfb313k_none", "runs_multitask_13k", "TFB3_seed0_l2.0", "none"),
 }
 
-
-# Backward-compatible default aliases:
-# Keep old query keys working and point them to GREEN versions by default.
+# Backward-compatible default aliases (Point old unsuffixed keys to GREEN models)
 MODEL_ZOO: Dict[str, ModelSpec] = {
-    # old-style keys
     "convnext3k": MODEL_ZOO_EXPLICIT["convnext3k_green"],
     "effb03k": MODEL_ZOO_EXPLICIT["effb03k_green"],
     "mnv33k": MODEL_ZOO_EXPLICIT["mnv33k_green"],
@@ -120,6 +118,5 @@ MODEL_ZOO: Dict[str, ModelSpec] = {
     "swint13k": MODEL_ZOO_EXPLICIT["swint13k_green"],
     "tfb313k": MODEL_ZOO_EXPLICIT["tfb313k_green"],
 
-    # explicit keys
     **MODEL_ZOO_EXPLICIT,
 }

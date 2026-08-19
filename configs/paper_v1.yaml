@@ -1,0 +1,46 @@
+﻿# Master Paper Experiment Specification (protocol_version: paper_v1)
+# Paper: "A Smartphone-AI-WebGIS Platform for Real-Time Monitoring of Inorganic Nitrogen in Water"
+
+protocol_version: "paper_v1"
+seed: 0
+image_size: 224
+ppm_scale: "log1p"
+
+# Training schedule (60 total epochs, with 5 warmup epochs included)
+epochs: 60
+warmup_epochs: 5
+patience: 10
+
+# Optimization & Regularization
+optimizer: "AdamW"
+lr: 0.0002
+weight_decay: 0.0001
+loss_weight_cls: 1.0
+loss_weight_reg: 2.0
+label_smoothing: 0.05
+drop: 0.2
+drop_path: 0.1
+grad_clip: 1.0
+ema: false
+
+# Model selection formula (unsmoothed validation score)
+selection_metric: "(1.0 - Acc) + 2.0 * MAE"
+
+# Exact Six Vision Backbones
+backbones:
+  mnv3: "mobilenetv3_large_100.ra_in1k"
+  effb0: "efficientnet_b0.ra_in1k"
+  nfnet: "dm_nfnet_f2.dm_in1k"
+  tfb3: "tf_efficientnet_b3.ns_jft_in1k"
+  convnext: "convnext_tiny.fb_in1k"
+  swint: "swin_tiny_patch4_window7_224.ms_in1k"
+
+# Datasets & Calibration Variants
+datasets:
+  - "3k"
+  - "10k"
+  - "13k"
+
+calibration_modes:
+  - "none"
+  - "greenborder"

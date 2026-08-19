@@ -1,13 +1,33 @@
-/Spike_test_AI
+﻿# Byte-compiled / optimized / DLL files
 __pycache__/
 **/__pycache__/
 *.py[cod]
 *$py.class
-/weights1
-/weights
-/export_tree.py
-/venv
-/data_raw
-/data_splits_B
-/Results
-/weights_tree.txt
+
+# Virtual environments & IDE
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Heavy model binary weights (keep manifest & README tracked)
+weights/*.pt
+weights/**/*.pt
+!weights/README.md
+!weights/checkpoints_manifest.csv
+
+# Raw data images (manifests remain tracked)
+data/raw/
+data_raw/
+data_splits_B/
+
+# Evaluation outputs & scratch
+results/*.csv
+results/**/*.csv
+results/*.json
+results/**/*.json
+tmp/
+*.log

@@ -1,783 +1,439 @@
-﻿# train_classifier.py
-import os, json, math, argparse, logging
-from pathlib import Path
+﻿# -*- coding: utf-8 -*-
+"""
+Multi-Task Heteroscedastic Neural Network Training Protocol for Publication Reproduction.
 
-import cv2
+Key Highlights:
+- Architecture: Canonical MultiTaskHetero with MLP2 task heads (512 hidden, ReLU, Dropout 0.3).
+- Training Schedule: 60 total epochs (epochs 1-5 warmup with frozen backbone).
+- Loss Function: Heteroscedastic Gaussian Negative Log-Likelihood + Label-smoothed Cross-Entropy.
+- Loss Balancing: lambda_cls = 1.0, lambda_reg = 2.0.
+- Selection Metric: Score = (1.0 - Acc) + 2.0 * MAE (unsmoothed validation).
+- Seed: 0 deterministic baseline.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import os
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-
-import timm
-from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from albumentations import (
-    Compose, Resize, Normalize,
-    Rotate, Affine, RandomBrightnessContrast, GaussianBlur, HueSaturationValue
+from ai_chemistry.data.loaders import (
+    ChemistryDataset,
+    inverse_scale_ppm,
+    load_publication_splits,
+    prepare_split_frame,
+    scale_ppm,
 )
-from albumentations.pytorch import ToTensorV2
+from ai_chemistry.modeling import MultiTaskHetero, PAPER_BACKBONES
+from ai_chemistry.preprocessing import (
+    get_normalizer,
+    make_eval_transform,
+    make_train_transform,
+)
 
 torch.backends.cudnn.benchmark = True
-logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s][%(levelname)s] %(message)s")
+logger = logging.getLogger("ai_chemistry.train")
 
-# ===================== Utils =====================
-IMNET_MEAN = (0.485, 0.456, 0.406)
-IMNET_STD  = (0.229, 0.224, 0.225)
 
-def set_seed(seed=42):
+def set_seed(seed: int = 0) -> None:
+    """Ensure fully deterministic seed initialization across all libraries."""
     import random
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def safe_mape(y_true, y_pred, eps=1e-8):
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    denom = np.clip(np.abs(y_true), eps, None)
-    return float(np.mean(np.abs((y_true - y_pred)/denom))*100.0)
 
-def inverse_scale(ppm_scaled, ppm_scale, ppm_min=None, ppm_max=None):
-    if ppm_scale == 'log1p':
-        return math.expm1(ppm_scaled)
-    elif ppm_scale == 'minmax':
-        return ppm_scaled * (ppm_max - ppm_min) + ppm_min
-    return ppm_scaled
+def safe_mape(y_true, y_pred, eps: float = 1e-6) -> float:
+    y_t = np.asarray(y_true, dtype=np.float64)
+    y_p = np.asarray(y_pred, dtype=np.float64)
+    denom = np.maximum(np.abs(y_t), eps)
+    return float(np.mean(np.abs((y_t - y_p) / denom))) * 100.0
 
-def srgb_to_linear(x):
-    a = 0.055
-    return np.where(x <= 0.04045, x/12.92, ((x + a)/(1+a)) ** 2.4)
-
-def linear_to_srgb(x):
-    a = 0.055
-    return np.where(x <= 0.0031308, 12.92*x, (1+a)*(x ** (1/2.4)) - a)
-
-# ===================== Calibration =====================
-class IdentityNormalizer:
-    """
-    Không calibration: chỉ chuyển BGR->RGB và scale về [0..1]
-    Trả về RGB float32 [0..1]
-    """
-    def __call__(self, image_bgr):
-        if image_bgr is None:
-            raise ValueError("IdentityNormalizer: image_bgr is None")
-        if image_bgr.dtype not in (np.float32, np.float64):
-            rgb = image_bgr[..., ::-1].astype(np.float32) / 255.0
-        else:
-            rgb = image_bgr[..., ::-1].astype(np.float32)
-        return np.clip(rgb, 0.0, 1.0)
-
-class GreenBorderNormalizer:
-    """
-    Green-border normalization (reference patch / border ring).
-    Input: BGR uint8
-    Output: RGB float32 [0..1]
-    """
-    def __init__(self,
-                 hsv_lower=(35, 40, 40), hsv_upper=(95, 255, 255),
-                 ring_frac=0.08, inner_margin=2, min_green_pixels=300,
-                 epsilon=1e-6):
-        self.hsv_lower = np.array(hsv_lower, dtype=np.uint8)
-        self.hsv_upper = np.array(hsv_upper, dtype=np.uint8)
-        self.ring_frac = float(ring_frac)
-        self.inner_margin = int(inner_margin)
-        self.min_green_pixels = int(min_green_pixels)
-        self.eps = float(epsilon)
-
-    def _to_rgb01(self, img_bgr):
-        if img_bgr.dtype not in (np.float32, np.float64):
-            img_bgr = img_bgr.astype(np.float32) / 255.0
-        return np.clip(img_bgr[..., ::-1], 0.0, 1.0)
-
-    def _ring_mask(self, h, w, ring_px):
-        m = np.zeros((h, w), dtype=np.uint8)
-        m[:ring_px, :] = 255; m[-ring_px:, :] = 255
-        m[:, :ring_px] = 255; m[:, -ring_px:] = 255
-        im = self.inner_margin
-        if 2*im < h and 2*im < w:
-            # remove inner margin from ring
-            m[im:-im, im:-im] = 0
-        return m
-
-    def __call__(self, image_bgr):
-        rgb = self._to_rgb01(image_bgr)
-        h, w = rgb.shape[:2]
-        ring_px = max(2, int(min(h, w) * self.ring_frac))
-        ring = self._ring_mask(h, w, ring_px)
-
-        img_u8 = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
-        hsv = cv2.cvtColor(img_u8, cv2.COLOR_RGB2HSV)
-        mask = cv2.inRange(hsv, self.hsv_lower, self.hsv_upper)
-        mask = cv2.bitwise_and(mask, ring)
-
-        green_pixels = mask > 0
-        if green_pixels.sum() < self.min_green_pixels:
-            # fallback: dùng toàn ring
-            green_pixels = ring > 0
-
-        if green_pixels.sum() == 0:
-            mean_border = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-        else:
-            lin = srgb_to_linear(rgb)
-            mean_border = lin[green_pixels].mean(axis=0).astype(np.float32)
-            mean_border = np.clip(mean_border, 0.05, 1.0)
-
-        lin = srgb_to_linear(rgb)
-        norm_lin = lin / (mean_border[None, None, :] + self.eps)
-        norm_lin = np.clip(norm_lin, 0.0, 1.0)
-        norm = linear_to_srgb(norm_lin)
-        return np.clip(norm, 0.0, 1.0).astype(np.float32)
-
-def build_normalizer(calib_mode: str, args):
-    calib_mode = (calib_mode or "greenborder").lower()
-    if calib_mode == "none":
-        return IdentityNormalizer()
-    if calib_mode == "greenborder":
-        return GreenBorderNormalizer(
-            ring_frac=args.ring_frac,
-            inner_margin=args.inner_margin,
-            min_green_pixels=args.min_green_pixels
-        )
-    raise ValueError(f"Unknown --calib={calib_mode}. Use: none | greenborder")
-
-# ===================== Transforms =====================
-def make_transforms(image_size=224, train=True):
-    if train:
-        return Compose([
-            Resize(image_size, image_size, interpolation=cv2.INTER_AREA),
-            Rotate(limit=10, p=0.5),
-            Affine(scale=(0.97, 1.03), translate_percent=0.02, shear=4, p=0.5),
-            HueSaturationValue(hue_shift_limit=5, sat_shift_limit=12, val_shift_limit=6, p=0.4),
-            RandomBrightnessContrast(brightness_limit=0.06, contrast_limit=0.06, p=0.3),
-            GaussianBlur(blur_limit=(3, 3), p=0.15),
-            Normalize(mean=IMNET_MEAN, std=IMNET_STD, max_pixel_value=1.0),
-            ToTensorV2()
-        ])
-    else:
-        return Compose([
-            Resize(image_size, image_size, interpolation=cv2.INTER_AREA),
-            Normalize(mean=IMNET_MEAN, std=IMNET_STD, max_pixel_value=1.0),
-            ToTensorV2()
-        ])
-
-# ================= Dataset =================
-SPLIT_NAMES = ('train', 'val', 'test')
-REQUIRED_LABEL_COLUMNS = {'path', 'chemical', 'ppm'}
-
-
-def _normalise_label_path(path_value):
-    """Return a safe, platform-native relative path from a CSV path value."""
-    raw_path = str(path_value).strip().replace('\\', '/')
-    parts = [part for part in raw_path.split('/') if part not in ('', '.')]
-    if not parts or '..' in parts or Path(raw_path).is_absolute():
-        raise ValueError(f"Invalid relative image path in labels: {path_value!r}")
-    return Path(*parts)
-
-
-def _prepare_split_frame(df, split_name, csv_path):
-    missing_columns = REQUIRED_LABEL_COLUMNS.difference(df.columns)
-    if missing_columns:
-        missing = ', '.join(sorted(missing_columns))
-        raise ValueError(f"{csv_path} is missing required columns: {missing}")
-    if df.empty:
-        raise ValueError(f"{csv_path} contains no rows.")
-
-    frame = df.copy()
-    if 'split' in frame.columns:
-        declared = frame['split'].astype(str).str.strip().str.lower()
-        mismatched = declared.ne(split_name)
-        if mismatched.any():
-            values = sorted(declared[mismatched].unique().tolist())
-            raise ValueError(
-                f"{csv_path} is the {split_name} CSV but contains split values: {values}"
-            )
-    frame['split'] = split_name
-
-    frame['chemical'] = frame['chemical'].astype(str).str.strip().str.upper()
-    invalid_chemicals = sorted(set(frame['chemical']) - {'NH4', 'NO2'})
-    if invalid_chemicals:
-        raise ValueError(f"{csv_path} contains unsupported chemicals: {invalid_chemicals}")
-
-    frame['ppm'] = pd.to_numeric(frame['ppm'], errors='coerce')
-    invalid_ppm = frame['ppm'].isna() | ~np.isfinite(frame['ppm']) | (frame['ppm'] < 0)
-    if invalid_ppm.any():
-        raise ValueError(f"{csv_path} contains {int(invalid_ppm.sum())} invalid ppm values.")
-
-    # Validate path syntax here; file existence is checked after all splits are loaded.
-    frame['path'].map(_normalise_label_path)
-    return frame.reset_index(drop=True)
-
-
-def load_training_splits(args):
-    """
-    Load either the submission layout (preferred) or one legacy combined CSV.
-
-    Submission layout:
-      <submission_dir>/raw/<dataset>/...
-      <submission_dir>/labels/<dataset>/{train,val,test}.csv
-    """
-    if args.labels_csv:
-        if not args.root_dir:
-            raise ValueError("--root_dir is required when using legacy --labels_csv.")
-        images_root = Path(args.root_dir).expanduser()
-        labels_csv = Path(args.labels_csv).expanduser()
-        if not labels_csv.is_file():
-            raise FileNotFoundError(f"Labels CSV not found: {labels_csv}")
-        labels = pd.read_csv(labels_csv)
-        if 'split' not in labels.columns:
-            raise ValueError(f"Legacy labels CSV must contain a split column: {labels_csv}")
-        split_frames = {
-            split: _prepare_split_frame(
-                labels[labels['split'].astype(str).str.strip().str.lower() == split],
-                split,
-                labels_csv,
-            )
-            for split in SPLIT_NAMES
-        }
-        data_description = f"legacy CSV {labels_csv}"
-    else:
-        submission_dir = Path(args.submission_dir).expanduser()
-        images_root = (
-            Path(args.root_dir).expanduser()
-            if args.root_dir
-            else submission_dir / 'raw' / args.dataset
-        )
-        labels_dir = (
-            Path(args.labels_dir).expanduser()
-            if args.labels_dir
-            else submission_dir / 'labels' / args.dataset
-        )
-        split_frames = {}
-        for split in SPLIT_NAMES:
-            csv_path = labels_dir / f'{split}.csv'
-            if not csv_path.is_file():
-                raise FileNotFoundError(f"Missing {split} labels CSV: {csv_path}")
-            split_frames[split] = _prepare_split_frame(
-                pd.read_csv(csv_path), split, csv_path
-            )
-        data_description = f"submission dataset '{args.dataset}' at {submission_dir}"
-
-    if not images_root.is_dir():
-        raise FileNotFoundError(f"Images root not found: {images_root}")
-    images_root = images_root.resolve()
-
-    all_frames = pd.concat(split_frames.values(), ignore_index=True)
-    canonical_paths = all_frames['path'].astype(str).str.replace('\\', '/', regex=False).str.lower()
-    duplicated = canonical_paths.duplicated(keep=False)
-    if duplicated.any():
-        examples = all_frames.loc[duplicated, 'path'].head(5).tolist()
-        raise ValueError(f"Duplicate image paths across label splits: {examples}")
-
-    missing_images = []
-    for relative_path in all_frames['path']:
-        image_path = images_root / _normalise_label_path(relative_path)
-        if not image_path.is_file():
-            missing_images.append(str(image_path))
-            if len(missing_images) == 5:
-                break
-    if missing_images:
-        raise FileNotFoundError(
-            "Label paths do not resolve under the images root. First missing files: "
-            + '; '.join(missing_images)
-        )
-
-    logging.info("Loaded %s", data_description)
-    logging.info("Images root: %s", images_root)
-    return images_root, split_frames['train'], split_frames['val'], split_frames['test']
-
-
-class ChemistryDataset(Dataset):
-    """
-    DataFrame nhãn yêu cầu các cột:
-      - path (relative to root_dir)
-      - chemical ('NH4'/'NO2')
-      - ppm (float)
-    Các cột device, datetime và split được giữ làm metadata nếu có.
-    """
-    def __init__(self, df, root_dir, chemical_encoder,
-                 ppm_scale='log1p', ppm_min=None, ppm_max=None,
-                 transform=None, gnorm=None):
-        self.df = df.reset_index(drop=True)
-        self.root_dir = Path(root_dir)
-        self.ppm_scale = ppm_scale
-        self.transform = transform
-        self.gnorm = gnorm if gnorm is not None else IdentityNormalizer()
-        self.le = chemical_encoder
-
-        # minmax scale phải dùng cùng ppm_min/max của TRAIN set
-        if self.ppm_scale == 'minmax':
-            if ppm_min is None or ppm_max is None:
-                raise ValueError("ppm_scale='minmax' cần ppm_min/ppm_max (từ train_df).")
-            self.ppm_min = float(ppm_min)
-            self.ppm_max = float(ppm_max)
-        else:
-            self.ppm_min = None
-            self.ppm_max = None
-
-    def __len__(self):
-        return len(self.df)
-
-    def _scale_ppm(self, ppm):
-        if self.ppm_scale == 'log1p':
-            return math.log1p(ppm)
-        elif self.ppm_scale == 'minmax':
-            return (ppm - self.ppm_min) / (self.ppm_max - self.ppm_min + 1e-12)
-        return ppm
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        img_path = self.root_dir / row['path']
-        img = cv2.imread(str(img_path))
-        if img is None:
-            raise FileNotFoundError(f"Cannot read image: {img_path}")
-
-        # calibration (or identity)
-        img_rgb01 = self.gnorm(img)  # RGB [0..1]
-
-        if self.transform is not None:
-            out = self.transform(image=img_rgb01)
-            img_t = out["image"]
-        else:
-            # fallback (không khuyến khích)
-            img_t = torch.from_numpy(img_rgb01.transpose(2,0,1)).float()
-
-        chem_idx = int(self.le.transform([row['chemical']])[0])
-        ppm_scaled = float(self._scale_ppm(float(row['ppm'])))
-        return img_t, chem_idx, ppm_scaled, str(img_path)
-
-# ================= Model (Two heads, heteroscedastic) =================
-class MultiTaskHetero(nn.Module):
-    """
-    - Backbone timm (configurable by --timm_name)
-    - head_cls: logits num_classes
-    - head_reg_NH4/NO2: mỗi head trả (mu, log_var)
-    """
-    def __init__(self, timm_name='efficientnetv2_s', num_classes=2, pretrained=True,
-                 drop=0.2, drop_path=0.1):
-        super().__init__()
-        self.backbone = timm.create_model(
-            timm_name, pretrained=pretrained, num_classes=0,
-            drop_rate=drop, drop_path_rate=drop_path
-        )
-        feat_dim = getattr(self.backbone, 'num_features', None)
-        if feat_dim is None:
-            # timm models thường có feature_info
-            try:
-                feat_dim = self.backbone.feature_info[-1]['num_chs']
-            except Exception:
-                raise RuntimeError("Cannot infer backbone feature dim. Please check timm model.")
-
-        self.head_cls = nn.Sequential(
-            nn.Dropout(p=0.2),
-            nn.Linear(feat_dim, num_classes)
-        )
-        # 2 analytes: NH4 (idx 0), NO2 (idx 1)
-        self.head_reg_NH4 = nn.Sequential(
-            nn.Dropout(p=0.2),
-            nn.Linear(feat_dim, 2)  # mu, log_var
-        )
-        self.head_reg_NO2 = nn.Sequential(
-            nn.Dropout(p=0.2),
-            nn.Linear(feat_dim, 2)  # mu, log_var
-        )
-
-    def forward(self, x):
-        feat = self.backbone(x)                 # (B, feat_dim)
-        logits = self.head_cls(feat)            # (B, C)
-        reg_nh4 = self.head_reg_NH4(feat)       # (B,2)
-        reg_no2 = self.head_reg_NO2(feat)       # (B,2)
-        return logits, reg_nh4, reg_no2, feat
-
-# ================= Losses =================
-def focal_loss(logits, targets, alpha=0.75, gamma=2.0):
-    ce = nn.CrossEntropyLoss(reduction='none')(logits, targets)
-    pt = torch.exp(-ce)
-    loss = alpha * (1-pt)**gamma * ce
-    return loss.mean()
 
 class GaussianNLLLossPerSample(nn.Module):
-    """Heteroscedastic Gaussian NLL per sample: 0.5*(log_var + (y-mu)^2/exp(log_var))"""
-    def __init__(self):
-        super().__init__()
-    def forward(self, mu, log_var, y):
-        # clamp log_var for stability
-        log_var = torch.clamp(log_var, min=-10.0, max=5.0)
-        return 0.5 * (log_var + (y - mu)**2 / torch.exp(log_var))
+    """Heteroscedastic Gaussian Negative Log-Likelihood Loss."""
 
-# ================= EMA =================
-class EMA:
-    def __init__(self, model, decay=0.999):
-        self.decay = decay
-        self.shadow = {}
-        self.backup = {}
-        for k, v in model.state_dict().items():
-            if v.dtype.is_floating_point:
-                self.shadow[k] = v.detach().clone()
+    def forward(self, mu: torch.Tensor, log_var: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        inv_var = torch.exp(-log_var).clamp(max=1e6)
+        return 0.5 * (inv_var * (target - mu) ** 2 + log_var)
 
-    @torch.no_grad()
-    def update(self, model):
-        for k, v in model.state_dict().items():
-            if k in self.shadow:
-                self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1 - self.decay)
 
-    def apply_to(self, model):
-        self.backup = {}
-        state = model.state_dict()
-        for k in self.shadow:
-            self.backup[k] = state[k].detach().clone()
-            state[k].copy_(self.shadow[k])
-
-    def restore(self, model):
-        if not self.backup:
-            return
-        state = model.state_dict()
-        for k in self.backup:
-            state[k].copy_(self.backup[k])
-        self.backup = {}
-
-# ================= Eval =================
-def evaluate(model, loader, device, ppm_scale, ppm_min, ppm_max, prefix="Eval"):
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    ppm_scale: str,
+    ppm_min: Optional[float],
+    ppm_max: Optional[float],
+    prefix: str = "Eval",
+) -> Dict[str, float]:
     model.eval()
     y_true_cls, y_pred_cls = [], []
-    y_true_ppm_s, y_pred_ppm_s = [], []
+    y_true_reg_s, y_pred_reg_s = [], []
 
     per_class_true = {0: [], 1: []}
     per_class_pred = {0: [], 1: []}
 
-    for images, cls_labels, reg_labels, _ in tqdm(loader, desc=prefix):
-        images = images.to(device, non_blocking=True)
-        cls_labels = cls_labels.to(device, non_blocking=True)
-        reg_labels = reg_labels.to(device, non_blocking=True).float()
+    for x, y_cls, y_reg, _ in tqdm(loader, desc=prefix, leave=False):
+        x = x.to(device, non_blocking=True)
+        y_cls = y_cls.to(device, non_blocking=True)
+        y_reg = y_reg.to(device, non_blocking=True).float()
 
-        cls_out, rNH4, rNO2, _ = model(images)
-        pred_cls = torch.argmax(cls_out, dim=1)  # (B,)
+        logits, rNH4, rNO2 = model(x)
+        pred_cls = logits.argmax(dim=1)
 
-        # chọn mu theo lớp DỰ ĐOÁN (đúng với pipeline inference)
-        mu_NH4 = rNH4[:, 0]; mu_NO2 = rNO2[:, 0]
-        mu_heads = torch.stack([mu_NH4, mu_NO2], dim=1)  # (B,2)
-        reg_pred_scaled = mu_heads.gather(1, pred_cls.view(-1,1)).squeeze(1)
+        mu_NH4 = rNH4[:, 0]
+        mu_NO2 = rNO2[:, 0]
+        mu_heads = torch.stack([mu_NH4, mu_NO2], dim=1)
+        pred_reg_s = mu_heads.gather(1, pred_cls.view(-1, 1)).squeeze(1)
 
+        y_true_cls.extend(y_cls.detach().cpu().numpy().tolist())
         y_pred_cls.extend(pred_cls.detach().cpu().numpy().tolist())
-        y_true_cls.extend(cls_labels.detach().cpu().numpy().tolist())
-        y_pred_ppm_s.extend(reg_pred_scaled.detach().cpu().numpy().tolist())
-        y_true_ppm_s.extend(reg_labels.detach().cpu().numpy().tolist())
+        y_true_reg_s.extend(y_reg.detach().cpu().numpy().tolist())
+        y_pred_reg_s.extend(pred_reg_s.detach().cpu().numpy().tolist())
 
-        # per-class theo NHÃN THẬT (để breakdown)
-        cls_true_np = cls_labels.detach().cpu().numpy()
-        reg_true_np = reg_labels.detach().cpu().numpy()
-        reg_pred_np = reg_pred_scaled.detach().cpu().numpy()
-        for i, gt in enumerate(cls_true_np):
-            per_class_true[int(gt)].append(float(reg_true_np[i]))
-            per_class_pred[int(gt)].append(float(reg_pred_np[i]))
+        y_cls_np = y_cls.detach().cpu().numpy()
+        y_reg_np = y_reg.detach().cpu().numpy()
+        pred_reg_np = pred_reg_s.detach().cpu().numpy()
+        for i, gt in enumerate(y_cls_np):
+            per_class_true[int(gt)].append(float(y_reg_np[i]))
+            per_class_pred[int(gt)].append(float(pred_reg_np[i]))
 
-    acc = accuracy_score(y_true_cls, y_pred_cls)
-    f1_macro  = f1_score(y_true_cls, y_pred_cls, average='macro')
-    f1_weight = f1_score(y_true_cls, y_pred_cls, average='weighted')
+    acc = float(accuracy_score(y_true_cls, y_pred_cls))
+    f1_macro = float(f1_score(y_true_cls, y_pred_cls, average="macro", zero_division=0))
+    f1_weighted = float(f1_score(y_true_cls, y_pred_cls, average="weighted", zero_division=0))
 
-    inv = lambda arr: [inverse_scale(v, ppm_scale, ppm_min, ppm_max) for v in arr]
-    y_true_ppm = inv(y_true_ppm_s)
-    y_pred_ppm = inv(y_pred_ppm_s)
-
-    mae  = mean_absolute_error(y_true_ppm, y_pred_ppm)
-    mape = safe_mape(y_true_ppm, y_pred_ppm)
-
-    per_class_metrics = {}
-    for k in [0,1]:
-        if len(per_class_true[k]) == 0:
-            per_class_metrics[k] = {"MAE": None, "MAPE": None}
-        else:
-            t = inv(per_class_true[k]); p = inv(per_class_pred[k])
-            per_class_metrics[k] = {
-                "MAE": float(mean_absolute_error(t, p)),
-                "MAPE": float(safe_mape(t, p))
-            }
+    y_true_ppm = [inverse_scale_ppm(v, ppm_scale, ppm_min, ppm_max) for v in y_true_reg_s]
+    y_pred_ppm = [inverse_scale_ppm(v, ppm_scale, ppm_min, ppm_max) for v in y_pred_reg_s]
+    mae = float(mean_absolute_error(y_true_ppm, y_pred_ppm))
+    mape = float(safe_mape(y_true_ppm, y_pred_ppm))
 
     logs = {
-        'acc': float(acc),
-        'f1_macro': float(f1_macro),
-        'f1_weighted': float(f1_weight),
-        'mae': float(mae),
-        'mape': float(mape),
-        'per_class': per_class_metrics
+        "acc": acc,
+        "f1_macro": f1_macro,
+        "f1_weighted": f1_weighted,
+        "mae": mae,
+        "mape": mape,
     }
-    logging.info(
-        f"{prefix} | acc {acc:.4f} | f1_macro {f1_macro:.4f} | "
-        f"MAE {mae:.4f} | MAPE {mape:.4f}"
+
+    logger.info(
+        f"{prefix} | Acc: {acc:.4f} | Macro-F1: {f1_macro:.4f} | MAE: {mae:.4f} ppm | MAPE: {mape:.2f}%"
     )
     return logs
 
-# ================= Train =================
-def train(args):
+
+def resolve_data_splits(args) -> Tuple[Path, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Resolve data manifests from either the publication manifest directory or legacy CSV."""
+    if args.dataset:
+        manifests_dir = args.manifests_dir or "data/manifests"
+        images_root = args.images_root or args.data_root or args.root_dir or "data"
+        return load_publication_splits(manifests_dir, args.dataset, images_root)
+
+    if args.labels_csv:
+        csv_path = Path(args.labels_csv).resolve()
+        if not csv_path.is_file():
+            raise FileNotFoundError(f"Labels CSV not found: {csv_path}")
+        df = pd.read_csv(csv_path)
+        if "split" not in df.columns:
+            raise ValueError(f"Legacy CSV must contain a 'split' column: {csv_path}")
+
+        images_root = Path(args.images_root or args.data_root or args.root_dir or ".").resolve()
+        train_df = prepare_split_frame(df[df["split"].str.lower() == "train"], "train", csv_path)
+        val_df = prepare_split_frame(df[df["split"].str.lower() == "val"], "val", csv_path)
+        test_df = prepare_split_frame(df[df["split"].str.lower() == "test"], "test", csv_path)
+        return images_root, train_df, val_df, test_df
+
+    # Default fallback: 13k
+    manifests_dir = args.manifests_dir or "data/manifests"
+    images_root = args.images_root or args.data_root or args.root_dir or "data"
+    return load_publication_splits(manifests_dir, "13k", images_root)
+
+
+def train(args) -> None:
     set_seed(args.seed)
 
-    images_root, train_df, val_df, test_df = load_training_splits(args)
+    device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
+    logger.info(f"Using device: {device}")
 
-    # label encoding: giữ thứ tự nhất quán theo train
-    le = LabelEncoder().fit(train_df['chemical'])
-    classes = list(le.classes_)  # thường: ['NH4','NO2']
-    if classes != ['NH4', 'NO2']:
-        raise ValueError(f"Training split must contain both NH4 and NO2; found: {classes}")
-    num_classes = len(classes)
+    images_root, train_df, val_df, test_df = resolve_data_splits(args)
+    logger.info(f"Loaded dataset splits -> Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
 
-    # minmax scale (nếu dùng) phải dựa trên train_df
+    classes = ("NH4", "NO2")
+    class_to_idx = {c: i for i, c in enumerate(classes)}
+
     ppm_min = ppm_max = None
-    if args.ppm_scale == 'minmax':
-        ppm_min, ppm_max = float(train_df['ppm'].min()), float(train_df['ppm'].max())
+    if args.ppm_scale == "minmax":
+        ppm_min = float(train_df["ppm"].min())
+        ppm_max = float(train_df["ppm"].max())
 
-    # calibration toggle
-    gnorm = build_normalizer(args.calib, args)
+    normalizer = get_normalizer(
+        args.calib_mode,
+        ring_frac=args.ring_frac,
+        inner_margin=args.inner_margin,
+        min_green_pixels=args.min_green_pixels,
+    )
 
-    t_train = make_transforms(args.image_size, train=True)
-    t_eval  = make_transforms(args.image_size, train=False)
+    tf_train = make_train_transform(args.image_size)
+    tf_eval = make_eval_transform(args.image_size)
 
-    train_ds = ChemistryDataset(train_df, images_root, le,
-                                ppm_scale=args.ppm_scale, ppm_min=ppm_min, ppm_max=ppm_max,
-                                transform=t_train, gnorm=gnorm)
-    val_ds   = ChemistryDataset(val_df,   images_root, le,
-                                ppm_scale=args.ppm_scale, ppm_min=ppm_min, ppm_max=ppm_max,
-                                transform=t_eval, gnorm=gnorm)
-    test_ds  = ChemistryDataset(test_df,  images_root, le,
-                                ppm_scale=args.ppm_scale, ppm_min=ppm_min, ppm_max=ppm_max,
-                                transform=t_eval, gnorm=gnorm)
+    train_ds = ChemistryDataset(
+        train_df, images_root, class_to_idx, args.ppm_scale, tf_train, normalizer, ppm_min, ppm_max
+    )
+    val_ds = ChemistryDataset(
+        val_df, images_root, class_to_idx, args.ppm_scale, tf_eval, normalizer, ppm_min, ppm_max
+    )
+    test_ds = ChemistryDataset(
+        test_df, images_root, class_to_idx, args.ppm_scale, tf_eval, normalizer, ppm_min, ppm_max
+    )
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True, drop_last=False)
-    val_loader   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                              num_workers=args.num_workers, pin_memory=True)
-    test_loader  = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                              num_workers=args.num_workers, pin_memory=True)
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True
+    )
 
-    logging.info(f"Train/Val/Test sizes: {len(train_ds)}/{len(val_ds)}/{len(test_ds)}")
-    logging.info(f"Classes (label encoder order): {classes}")
-    logging.info(f"Calibration mode: {args.calib}")
-
-    if args.validate_only:
-        logging.info("Dataset validation completed; training skipped (--validate_only).")
-        return
+    # Initialize Canonical MultiTaskHetero
+    timm_name = PAPER_BACKBONES.get(args.timm_name.lower(), args.timm_name)
+    logger.info(f"Initializing MultiTaskHetero with backbone: {timm_name}")
 
     model = MultiTaskHetero(
-        timm_name=args.timm_name, num_classes=num_classes,
-        pretrained=True, drop=0.2, drop_path=0.1
-    ).to(args.device)
+        timm_name=timm_name,
+        num_classes=len(classes),
+        pretrained=not args.scratch,
+        drop=args.drop,
+        drop_path=args.drop_path,
+        image_size=args.image_size,
+    ).to(device)
 
-    # freeze backbone (warmup)
-    for p in model.backbone.parameters():
-        p.requires_grad = False
+    # Backbone warmup: freeze backbone during warmup epochs
+    if args.warmup_epochs > 0:
+        logger.info(f"Freezing backbone for initial {args.warmup_epochs} warmup epochs.")
+        for p in model.backbone.parameters():
+            p.requires_grad = False
 
-    # losses
-    if args.focal:
-        crit_cls = None
-    else:
-        crit_cls = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
-    gauss_ps = GaussianNLLLossPerSample()
+    def make_optimizer(train_all: bool) -> optim.Optimizer:
+        params = model.parameters() if train_all else filter(lambda p: p.requires_grad, model.parameters())
+        return optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
-                            lr=args.lr, weight_decay=1e-4)
+    optimizer = make_optimizer(train_all=False if args.warmup_epochs > 0 else True)
 
-    total_epochs = args.warmup_epochs + args.epochs
-    def lr_lambda(epoch):
-        if epoch < args.warmup_epochs:
-            return (epoch + 1) / max(1, args.warmup_epochs)
-        t = (epoch - args.warmup_epochs) / max(1, args.epochs)
-        return 0.5 * (1 + math.cos(math.pi * t))
+    total_epochs = args.epochs  # 60 total epochs (warmup included)
+    use_amp = (device.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    def lr_lambda(epoch: int) -> float:
+        t = epoch / max(1, total_epochs)
+        return 0.5 * (1.0 + math.cos(math.pi * t))
+
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
-    use_amp = str(args.device).startswith('cuda')
-    try:
-        scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
-        autocast_ctx = lambda: torch.amp.autocast('cuda', enabled=use_amp)
-    except Exception:
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-        autocast_ctx = lambda: torch.cuda.amp.autocast(enabled=use_amp)
+    gauss_loss = GaussianNLLLossPerSample()
+    cls_loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
-    ema = EMA(model, decay=args.ema_decay) if args.ema_decay > 0 else None
+    save_ckpt = Path(args.save_ckpt or f"weights/runs_multitask_{args.dataset or '13k'}/{timm_name.split('.')[0]}_seed{args.seed}_l{args.loss_weight_reg}_{args.calib_mode}.pt")
+    save_meta = Path(args.save_meta or save_ckpt.with_suffix(".meta.json"))
+    save_ckpt.parent.mkdir(parents=True, exist_ok=True)
+    save_meta.parent.mkdir(parents=True, exist_ok=True)
 
-    best_val = float('inf')
+    best_val = float("inf")
+    best_epoch = 0
     patience = 0
-    score_hist = []
 
+    logger.info(f"Starting training run: Total Epochs={total_epochs}, Warmup={args.warmup_epochs}, Seed={args.seed}")
     for epoch in range(total_epochs):
         model.train()
-        if epoch == args.warmup_epochs:
+
+        # Unfreeze backbone after warmup
+        if args.warmup_epochs > 0 and epoch == args.warmup_epochs:
+            logger.info("Unfreezing backbone. Rebuilding optimizer for full network training.")
             for p in model.backbone.parameters():
                 p.requires_grad = True
-            optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+            optimizer = make_optimizer(train_all=True)
             scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
-        running_cls, running_reg = 0.0, 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{total_epochs} ({'warmup' if epoch<args.warmup_epochs else 'main'})")
-        for images, cls_labels, reg_labels, _ in pbar:
-            images = images.to(args.device, non_blocking=True)
-            cls_labels = cls_labels.to(args.device, non_blocking=True)
-            reg_labels = reg_labels.to(args.device, non_blocking=True).float()
+        running_cls = 0.0
+        running_reg = 0.0
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{total_epochs}", leave=False)
+        for x, y_cls, y_reg, _ in pbar:
+            x = x.to(device, non_blocking=True)
+            y_cls = y_cls.to(device, non_blocking=True)
+            y_reg = y_reg.to(device, non_blocking=True).float()
 
             optimizer.zero_grad(set_to_none=True)
-            with autocast_ctx():
-                cls_out, rNH4, rNO2, _ = model(images)
 
-                # hetero: chọn head theo NHÃN THẬT để tính loss (stable)
-                mu_NH4, lv_NH4 = rNH4[:,0], rNH4[:,1]
-                mu_NO2, lv_NO2 = rNO2[:,0], rNO2[:,1]
-                mu_heads = torch.stack([mu_NH4, mu_NO2], dim=1)  # (B,2)
-                lv_heads = torch.stack([lv_NH4, lv_NO2], dim=1)  # (B,2)
-                mu_true = mu_heads.gather(1, cls_labels.view(-1,1)).squeeze(1)
-                lv_true = lv_heads.gather(1, cls_labels.view(-1,1)).squeeze(1)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                logits, rNH4, rNO2 = model(x)
+                l_cls = cls_loss_fn(logits, y_cls)
 
-                if args.focal:
-                    l_cls = focal_loss(cls_out, cls_labels, alpha=args.focal_alpha, gamma=args.focal_gamma)
-                else:
-                    l_cls = crit_cls(cls_out, cls_labels)
+                mu_NH4, lv_NH4 = rNH4[:, 0], rNH4[:, 1]
+                mu_NO2, lv_NO2 = rNO2[:, 0], rNO2[:, 1]
+                mu_heads = torch.stack([mu_NH4, mu_NO2], dim=1)
+                lv_heads = torch.stack([lv_NH4, lv_NO2], dim=1)
+                mu_true = mu_heads.gather(1, y_cls.view(-1, 1)).squeeze(1)
+                lv_true = lv_heads.gather(1, y_cls.view(-1, 1)).squeeze(1)
 
-                l_reg_ps = gauss_ps(mu_true, lv_true, reg_labels)  # (B,)
-                l_reg = l_reg_ps.mean()
-
-                loss = l_cls + args.lambda_reg * l_reg
+                l_reg = gauss_loss(mu_true, lv_true, y_reg).mean()
+                loss = args.loss_weight_cls * l_cls + args.loss_weight_reg * l_reg
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
 
-            if ema is not None:
-                ema.update(model)
-
             running_cls += float(l_cls.item())
             running_reg += float(l_reg.item())
-            pbar.set_postfix(cls=f"{running_cls/max(1,pbar.n):.4f}",
-                             reg=f"{running_reg/max(1,pbar.n):.4f}")
+            pbar.set_postfix(
+                cls=f"{running_cls / max(1, pbar.n):.4f}",
+                reg=f"{running_reg / max(1, pbar.n):.4f}",
+            )
 
-        logging.info(f"Train | Cls {running_cls/len(train_loader):.4f} | Reg {running_reg/len(train_loader):.4f}")
         scheduler.step()
 
-        # validate (EMA weights nếu có)
-        if ema is not None:
-            ema.apply_to(model)
+        # Validation selection
+        val_logs = evaluate(model, val_loader, device, args.ppm_scale, ppm_min, ppm_max, prefix="Val")
+        val_score = args.loss_weight_cls * (1.0 - val_logs["acc"]) + args.loss_weight_reg * val_logs["mae"]
 
-        val_logs = evaluate(model, val_loader, args.device, args.ppm_scale, ppm_min, ppm_max, prefix="Val")
-
-        if ema is not None:
-            ema.restore(model)
-
-        # score: ưu tiên vừa classification vừa regression
-        val_score = (1.0 - val_logs['acc']) + val_logs['mae']
-        score_hist.append(val_score)
-        smooth = sum(score_hist[-3:]) / min(3, len(score_hist))
-
-        if smooth < best_val - 1e-6:
-            best_val = smooth
+        if val_score < best_val - 1e-6:
+            best_val = val_score
+            best_epoch = epoch + 1
             patience = 0
-            Path(os.path.dirname(args.save_path) or ".").mkdir(parents=True, exist_ok=True)
 
-            if ema is not None:
-                ema.apply_to(model)
+            # Save state dict and self-describing metadata
+            meta = {
+                "protocol_version": "paper_v1",
+                "architecture": "multitask_heteroscedastic_mlp2",
+                "head_variant": "mlp2",
+                "head_hidden_dim": 512,
+                "head_dropout": 0.3,
+                "timm_name": timm_name,
+                "image_size": args.image_size,
+                "classes": list(classes),
+                "ppm_scale": args.ppm_scale,
+                "ppm_min": ppm_min,
+                "ppm_max": ppm_max,
+                "calib_mode_train": args.calib_mode,
+                "drop": args.drop,
+                "drop_path": args.drop_path,
+                "loss_weight_cls": args.loss_weight_cls,
+                "loss_weight_reg": args.loss_weight_reg,
+                "label_smoothing": args.label_smoothing,
+                "optimizer": "AdamW",
+                "lr": args.lr,
+                "weight_decay": args.weight_decay,
+                "epochs_total_max": total_epochs,
+                "warmup_epochs": args.warmup_epochs,
+                "grad_clip": args.grad_clip,
+                "ema": False,
+                "seed": args.seed,
+                "selection_score_formula": "(1-accuracy) + 2.0*MAE",
+                "best_epoch": best_epoch,
+                "best_val_score": best_val,
+                "dataset": args.dataset or "custom",
+            }
 
-            torch.save({
-                'state_dict': model.state_dict(),
-                'classes': classes,
-                'ppm_scale': args.ppm_scale,
-                'ppm_min': ppm_min, 'ppm_max': ppm_max,
-                'image_size': args.image_size,
-                'timm_name': args.timm_name,
-                'calib': args.calib,
-                'seed': args.seed,
-                'two_reg_heads': True,
-                'heteroscedastic': True
-            }, args.save_path)
-            logging.info("Saved best to %s", args.save_path)
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    **meta,
+                },
+                save_ckpt,
+            )
 
-            if ema is not None:
-                ema.restore(model)
+            with open(save_meta, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+
+            logger.info(f"★ Saved Best Checkpoint (Epoch {best_epoch}, Score {best_val:.4f}): {save_ckpt}")
         else:
             patience += 1
             if patience >= args.patience:
-                logging.info("Early stopping.")
+                logger.info(f"Early stopping triggered at epoch {epoch + 1} (patience={args.patience}).")
                 break
 
-    # test best
-    ckpt = torch.load(args.save_path, map_location=args.device)
-    model.load_state_dict(ckpt['state_dict'])
-    test_logs = evaluate(model, test_loader, args.device, args.ppm_scale, ppm_min, ppm_max, prefix="Test")
-    logging.info(f"Done. Test: {json.dumps(test_logs, indent=2)}")
+    logger.info(f"Training completed. Best model from epoch {best_epoch} with val score {best_val:.4f}.")
 
-    meta = {
-        'classes': classes,
-        'ppm_scale': args.ppm_scale,
-        'ppm_min': ppm_min, 'ppm_max': ppm_max,
-        'image_size': args.image_size,
-        'timm_name': args.timm_name,
-        'calib': args.calib,
-        'seed': args.seed,
-        'two_reg_heads': True,
-        'heteroscedastic': True
-    }
-    with open(Path(args.save_path).with_suffix('.meta.json'), 'w', encoding='utf-8') as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-    logging.info(f"Saved meta to {Path(args.save_path).with_suffix('.meta.json')}")
+    if args.run_test:
+        logger.info("Executing final evaluation on test split using best checkpoint...")
+        ckpt = torch.load(save_ckpt, map_location=device)
+        model.load_state_dict(ckpt["state_dict"], strict=True)
+        _ = evaluate(model, test_loader, device, args.ppm_scale, ppm_min, ppm_max, prefix="Test")
 
-# ================= CLI =================
+
 def parse_args():
-    ap = argparse.ArgumentParser("Train NH4/NO2 two-heads heteroscedastic + calibration ablation")
-    # data
-    ap.add_argument('--submission_dir', type=str, default='data/submission',
-                    help="Root containing raw/<dataset> and labels/<dataset>.")
-    ap.add_argument('--dataset', type=str, default='13k', choices=['10k', '3k', '13k'],
-                    help="Dataset package to train on inside --submission_dir.")
-    ap.add_argument('--root_dir', type=str, default=None,
-                    help="Optional image-root override; required with legacy --labels_csv.")
-    ap.add_argument('--labels_dir', type=str, default=None,
-                    help="Optional directory containing train.csv, val.csv and test.csv.")
-    ap.add_argument('--labels_csv', type=str, default=None,
-                    help="Legacy combined CSV with a split column.")
-    ap.add_argument('--validate_only', action='store_true',
-                    help="Validate images and all three split CSVs, then exit without training.")
-    ap.add_argument('--image_size', type=int, default=224)
-    ap.add_argument('--batch_size', type=int, default=32)
-    ap.add_argument('--num_workers', type=int, default=2)
+    parser = argparse.ArgumentParser("AI-Chemistry Publication Model Trainer")
 
-    # model/backbone
-    ap.add_argument('--timm_name', type=str, default='efficientnetv2_s',
-                    help="e.g. efficientnetv2_s | convnext_base.fb_in1k | nfnet_f0.dm_in1k | vit_small_patch16_224.augreg_in1k")
+    # Data inputs
+    parser.add_argument("--dataset", type=str, default="13k", choices=["3k", "10k", "13k"])
+    parser.add_argument("--manifests_dir", type=str, default="data/manifests")
+    parser.add_argument("--images_root", type=str, default="data")
+    parser.add_argument("--data_root", type=str, default=None)
+    parser.add_argument("--root_dir", type=str, default=None)
+    parser.add_argument("--labels_csv", type=str, default=None)
 
-    # train
-    ap.add_argument('--lr', type=float, default=2e-4)
-    ap.add_argument('--epochs', type=int, default=60)
-    ap.add_argument('--warmup_epochs', type=int, default=5)
-    ap.add_argument('--patience', type=int, default=10)
-    ap.add_argument('--lambda_reg', type=float, default=1.0)
-    ap.add_argument('--ppm_scale', type=str, default='log1p', choices=['log1p','minmax','none'])
-    ap.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    ap.add_argument('--save_path', type=str, default='training/weights/twoheads_hetero_best.pt')
-    ap.add_argument('--seed', type=int, default=42)
+    # Architecture & Backbone
+    parser.add_argument(
+        "--timm_name",
+        type=str,
+        default="mobilenetv3_large_100.ra_in1k",
+        help="timm model identifier or alias (mnv3, effb0, nfnet, tfb3, convnext, swint).",
+    )
+    parser.add_argument("--image_size", type=int, default=224)
+    parser.add_argument("--drop", type=float, default=0.2)
+    parser.add_argument("--drop_path", type=float, default=0.1)
+    parser.add_argument("--scratch", action="store_true", help="Train from scratch without ImageNet weights.")
 
-    # calibration toggle
-    ap.add_argument('--calib', type=str, default='greenborder', choices=['none','greenborder'],
-                    help="Calibration mode for ablation: none | greenborder")
+    # Preprocessing
+    parser.add_argument("--calib_mode", type=str, default="none", choices=["none", "greenborder"])
+    parser.add_argument("--ring_frac", type=float, default=0.08)
+    parser.add_argument("--inner_margin", type=int, default=2)
+    parser.add_argument("--min_green_pixels", type=int, default=300)
 
-    # green norm params
-    ap.add_argument('--ring_frac', type=float, default=0.08)
-    ap.add_argument('--inner_margin', type=int, default=2)
-    ap.add_argument('--min_green_pixels', type=int, default=300)
+    # Hyperparameters
+    parser.add_argument("--epochs", type=int, default=60, help="Maximum TOTAL training epochs (warmup included).")
+    parser.add_argument("--warmup_epochs", type=int, default=5, help="Backbone frozen warmup epochs (included in total).")
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--loss_weight_cls", type=float, default=1.0)
+    parser.add_argument("--loss_weight_reg", type=float, default=2.0)
+    parser.add_argument("--label_smoothing", type=float, default=0.05)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--ppm_scale", type=str, default="log1p", choices=["log1p", "minmax", "none"])
 
-    # cls loss choices
-    ap.add_argument('--focal', action='store_true', help='use focal loss for classification')
-    ap.add_argument('--focal_alpha', type=float, default=0.75)
-    ap.add_argument('--focal_gamma', type=float, default=2.0)
-    ap.add_argument('--label_smoothing', type=float, default=0.05)
+    # Output & Runtime
+    parser.add_argument("--save_ckpt", type=str, default=None)
+    parser.add_argument("--save_meta", type=str, default=None)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--run_test", action="store_true", help="Run evaluation on test split after training.")
 
-    # ema & clip
-    ap.add_argument('--ema_decay', type=float, default=0.999)
-    ap.add_argument('--grad_clip', type=float, default=1.0)
+    return parser.parse_args()
 
-    return ap.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
-    if not args.validate_only:
-        os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
     train(args)

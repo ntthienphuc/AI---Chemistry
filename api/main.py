@@ -1,4 +1,4 @@
-# api/main.py
+﻿# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from functools import lru_cache
@@ -17,18 +17,24 @@ from .config import (
     VALID_CALIB_MODES,
     VALID_DATA_TYPES,
     VALID_MODEL_TYPES,
+    VALID_MODES,
     VALID_TRAIN_CALIBS,
     YOLO_WEIGHTS,
 )
 from .predictor import LoadedPredictor
 from .roi import (
-    YoloRoiConfig,
     GreenRoiConfig,
+    YoloRoiConfig,
     crop_roi_auto,
+    crop_roi_with_yolo,
 )
 from .schemas import ModelsResponse, PredictResponse, RegressionInfo, RoiInfo
 
-app = FastAPI(title="AI-Chemistry API", version="1.1.0")
+app = FastAPI(
+    title="AI-Chemistry REST API",
+    description="Multi-Task Deep Learning API for Real-Time Inorganic Nitrogen Strip Colorimetry",
+    version="1.1.0",
+)
 
 
 @lru_cache(maxsize=1)
@@ -36,9 +42,8 @@ def _load_yolo(weights_path: str) -> YOLO:
     return YOLO(weights_path)
 
 
-def get_yolo() -> YOLO | None:
+def get_yolo() -> Optional[YOLO]:
     if not YOLO_WEIGHTS.exists():
-        # Không có YOLO weights thì vẫn chạy fallback green/center
         return None
     return _load_yolo(str(YOLO_WEIGHTS))
 
@@ -68,7 +73,7 @@ def resolve_model_key(
     if model and model.strip():
         model_key = model.lower().strip()
         if model_key not in MODEL_ZOO:
-            raise ValueError(f"Model không hợp lệ: {model}. Xem /models")
+            raise ValueError(f"Invalid model key: '{model}'. Consult /models for available model identifiers.")
         return model_key
 
     missing = [
@@ -82,8 +87,8 @@ def resolve_model_key(
     ]
     if missing:
         raise ValueError(
-            "Thiếu model hoặc bộ tham số: data_type, model_type, train_calib. "
-            f"Đang thiếu: {', '.join(missing)}"
+            "Provide either 'model' parameter or complete triplet: 'data_type', 'model_type', 'train_calib'. "
+            f"Missing fields: {', '.join(missing)}"
         )
 
     data_type = data_type.lower().strip()
@@ -91,15 +96,15 @@ def resolve_model_key(
     train_calib = train_calib.lower().strip()
 
     if data_type not in VALID_DATA_TYPES:
-        raise ValueError(f"data_type không hợp lệ: {data_type}. Dùng: {'|'.join(VALID_DATA_TYPES)}")
+        raise ValueError(f"Invalid data_type: {data_type}. Allowed: {' | '.join(VALID_DATA_TYPES)}")
     if model_type not in VALID_MODEL_TYPES:
-        raise ValueError(f"model_type không hợp lệ: {model_type}. Dùng: {'|'.join(VALID_MODEL_TYPES)}")
+        raise ValueError(f"Invalid model_type: {model_type}. Allowed: {' | '.join(VALID_MODEL_TYPES)}")
     if train_calib not in VALID_TRAIN_CALIBS:
-        raise ValueError(f"train_calib không hợp lệ: {train_calib}. Dùng: {'|'.join(VALID_TRAIN_CALIBS)}")
+        raise ValueError(f"Invalid train_calib: {train_calib}. Allowed: {' | '.join(VALID_TRAIN_CALIBS)}")
 
     model_key = f"{model_type}{data_type}_{train_calib}"
     if model_key not in MODEL_ZOO:
-        raise ValueError(f"Không tìm thấy model key được build: {model_key}. Xem /models")
+        raise ValueError(f"Constructed model key not found: '{model_key}'. Consult /models.")
     return model_key
 
 
@@ -112,7 +117,7 @@ def get_predictor(model_key: str, calib_mode: str) -> LoadedPredictor:
     ckpt_path = spec.ckpt_path()
     meta_path = spec.meta_path()
     if not ckpt_path.exists():
-        raise RuntimeError(f"Không tìm thấy checkpoint: {ckpt_path}")
+        raise RuntimeError(f"Model checkpoint not found at: {ckpt_path}")
     if meta_path is not None and not meta_path.exists():
         meta_path = None
     return LoadedPredictor(
@@ -144,33 +149,53 @@ def health():
 
 @app.post("/predict", response_model=PredictResponse)
 async def predict(
-    model: Optional[str] = Query(None, description="Full model key, ví dụ: convnext10k_green"),
-    data_type: Optional[str] = Query(None, description="3k|10k|13k, dùng khi không truyền model"),
-    model_type: Optional[str] = Query(None, description="convnext|effb0|mnv3|nfnet|swint|tfb3, dùng khi không truyền model"),
-    train_calib: Optional[str] = Query(None, description="green|none, dùng khi không truyền model"),
-    roi_mode: str = Query("auto", description="auto|yolo|green|center"),
-    calib_mode: Optional[str] = Query(None, description="greenborder|none; bỏ trống thì suy ra từ model/train_calib"),
-    debug: bool = Query(False, description="Trả raw probs/mu/logvar nếu true"),
+    model: Optional[str] = Query(None, description="Full model identifier (e.g. convnext10k_green, mnv313k_none)"),
+    data_type: Optional[str] = Query(None, description="3k | 10k | 13k"),
+    model_type: Optional[str] = Query(None, description="convnext | effb0 | mnv3 | nfnet | swint | tfb3"),
+    train_calib: Optional[str] = Query(None, description="green | none"),
+    roi_mode: str = Query("auto", description="auto | yolo | green | center"),
+    calib_mode: Optional[str] = Query(None, description="greenborder | none (inferred from model if omitted)"),
+    mode: str = Query("app", description="app (default flexible) | paper (strict reproduction) | diagnostic (mismatch ablation)"),
+    debug: bool = Query(False, description="Include raw probabilities and latent representations in response"),
     file: UploadFile = File(...),
 ):
+    # Mode Validation
+    mode = (mode or "app").lower().strip()
+    if mode not in VALID_MODES:
+        raise HTTPException(status_code=400, detail=f"Invalid mode: '{mode}'. Allowed: {' | '.join(VALID_MODES)}")
+
     try:
         model_key = resolve_model_key(model, data_type, model_type, train_calib)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    try:
-        calib_mode = normalize_calib_mode(calib_mode or infer_calib_mode_from_model(model_key))
-    except ValueError:
-        valid = "|".join(VALID_CALIB_MODES)
-        raise HTTPException(status_code=400, detail=f"calib_mode không hợp lệ: {calib_mode}. Dùng: {valid}")
+    expected_calib = infer_calib_mode_from_model(model_key)
+
+    # Behavior by Mode
+    if mode == "paper":
+        roi_mode = "yolo"
+        if calib_mode is not None and calib_mode.lower().strip() != expected_calib:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Preprocessing mismatch rejected in paper mode! Model '{model_key}' requires '{expected_calib}', received '{calib_mode}'. Use mode=diagnostic for intentional mismatch experiments.",
+            )
+        calib_mode = expected_calib
+    elif mode == "diagnostic":
+        roi_mode = "yolo"
+        calib_mode = normalize_calib_mode(calib_mode or expected_calib)
+    else:  # mode == "app"
+        try:
+            calib_mode = normalize_calib_mode(calib_mode or expected_calib)
+        except ValueError:
+            valid = " | ".join(VALID_CALIB_MODES)
+            raise HTTPException(status_code=400, detail=f"Invalid calib_mode: '{calib_mode}'. Allowed: {valid}")
 
     data = await file.read()
     arr = np.frombuffer(data, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
-        raise HTTPException(status_code=400, detail="Ảnh upload không đọc được (cv2.imdecode failed).")
+        raise HTTPException(status_code=400, detail="Uploaded file cannot be decoded as an image.")
 
-    # ROI configs (bạn có thể tune ở đây nếu muốn)
     yolo_cfg = YoloRoiConfig(padding=0.10, conf=0.25, imgsz=640)
     green_cfg = GreenRoiConfig(
         ratio_center=0.75,
@@ -180,19 +205,25 @@ async def predict(
         min_area_ratio=0.002,
     )
 
-    # 1) ROI: YOLO -> green -> center (giữ viền xanh khi green)
+    # 1. ROI Localization
     try:
-        roi_bgr, source, bbox, padding, imgsz = crop_roi_auto(
-            yolo=get_yolo(),
-            image_bgr=img,
-            yolo_cfg=yolo_cfg,
-            green_cfg=green_cfg,
-            mode=roi_mode,
-        )
+        if mode in ("paper", "diagnostic") or roi_mode == "yolo":
+            yolo_model = get_yolo()
+            if yolo_model is None:
+                raise RuntimeError("YOLO weights required for strict paper/yolo mode but not found.")
+            roi_bgr, source, bbox, padding, imgsz = crop_roi_with_yolo(yolo_model, img, yolo_cfg)
+        else:
+            roi_bgr, source, bbox, padding, imgsz = crop_roi_auto(
+                yolo=get_yolo(),
+                image_bgr=img,
+                yolo_cfg=yolo_cfg,
+                green_cfg=green_cfg,
+                mode=roi_mode,
+            )
     except Exception as e:
-        raise HTTPException(status_code=422, detail=f"ROI error: {e}")
+        raise HTTPException(status_code=422, detail=f"ROI extraction error: {e}")
 
-    # 2) Predict
+    # 2. Multi-Task Heteroscedastic Inference
     try:
         pred = get_predictor(model_key, calib_mode).predict(roi_bgr)
     except Exception as e:
