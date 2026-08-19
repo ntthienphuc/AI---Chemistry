@@ -1,6 +1,6 @@
 ﻿<div align="center">
 
-# A Smartphone-AI-WebGIS Platform for Real-Time Monitoring of Inorganic Nitrogen in Water
+# AI-Chemistry: Multi-Task Deep Learning & REST API Engine for Inorganic Nitrogen Monitoring
 
 [![Paper Version](https://img.shields.io/badge/Protocol-paper--v1.0-2ea44f?style=for-the-badge&logo=git)](https://github.com/ntthienphuc/AI---Chemistry/releases/tag/paper-v1.0)
 [![Python Version](https://img.shields.io/badge/Python-3.10%20%7C%203.11-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
@@ -8,62 +8,64 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
 
-*An end-to-end analytical framework integrating smartphone digital colorimetry, multi-task heteroscedastic deep learning, and geospatial WebGIS for on-site quantification of ammonium ($\text{NH}_4^+$) and nitrite ($\text{NO}_2^-$).*
+*Official AI, Computer Vision, and REST API Backend repository accompanying the research article:*  
+**"A Smartphone-AI-WebGIS Platform for Real-Time Monitoring of Inorganic Nitrogen in Water"**
 
 ---
 
 </div>
 
-## 📌 Graphical Abstract & Platform Overview
+## 📌 Platform Architecture & System Integration
+
+This repository hosts the **core AI, computer vision pipeline, multi-task neural network architectures, frozen evaluation manifests, and REST API inference microservice** that powers the analytical backend of the integrated Smartphone-AI-WebGIS platform.
 
 ```text
- ┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
- │   Smartphone Camera    │  ───► │  YOLOv8n-Seg Detection │  ───► │ Green-Border Color Norm│
- │ (Ambient Illumination) │       │ (Autonomous Strip ROI) │       │ (Linear RGB Space)     │
- └────────────────────────┘       └────────────────────────┘       └────────────────────────┘
-                                                                               │
- ┌─────────────────────────────────────────────────────────────────────────────┘
- │
- ▼
  ┌──────────────────────────────────────────────────────────────────────────────────────────┐
- │ Multi-Task Heteroscedastic Deep Neural Network (Canonical MLP2 Task Heads)               │
+ │  1. ON-SITE DATA ACQUISITION & LOCALIZATION                                              │
+ │                                                                                          │
+ │   ┌────────────────────────┐       ┌────────────────────────┐       ┌──────────────────┐ │
+ │   │   Smartphone Camera    │  ───► │  YOLOv8n-Seg Detection │  ───► │ Green-Border     │ │
+ │   │ (Ambient Illumination) │       │ (Autonomous Strip ROI) │       │ Color Normalizer │ │
+ │   └────────────────────────┘       └────────────────────────┘       └──────────────────┘ │
+ └──────────────────────────────────────────────────────────────────────────────│───────────┘
+                                                                                │ (Linear RGB)
+ ┌──────────────────────────────────────────────────────────────────────────────▼───────────┐
+ │  2. MULTI-TASK HETEROSCEDASTIC DEEP NEURAL NETWORK (AI-CHEMISTRY CORE)                   │
  │                                                                                          │
  │  Shared Vision Backbone: ConvNeXt-T / MobileNetV3 / Swin-T / NFNet-F2 / EffNet-B0 / TFB3 │
  │                                                                                          │
- │  ├── Head 1 (Classification): Linear(d, 512) -> ReLU -> Dropout -> Linear(512, 2)       │
- │  │   └── Predicted Analyte: Ammonium (NH4+) vs. Nitrite (NO2-)                           │
+ │  ├── Task Head 1 (Classification): Linear(d, 512) -> ReLU -> Dropout -> Linear(512, 2)  │
+ │  │   └── Analyte Identification: Ammonium (NH4+) vs. Nitrite (NO2-)                      │
  │  │                                                                                       │
- │  ├── Head 2 (NH4+ Regression): Linear(d, 512) -> ReLU -> Dropout -> Linear(512, 2)      │
- │  │   └── Concentration Mean (mu) + Aleatoric Log-Variance (log_var)                     │
+ │  ├── Task Head 2 (NH4+ Quantification): Linear(d, 512) -> ReLU -> Dropout -> Linear(512, 2)
+ │  │   └── Predicted Concentration (mu) + Aleatoric Log-Variance (log_var)                 │
  │  │                                                                                       │
- │  └── Head 3 (NO2- Regression): Linear(d, 512) -> ReLU -> Dropout -> Linear(512, 2)      │
- │      └── Concentration Mean (mu) + Aleatoric Log-Variance (log_var)                     │
- └──────────────────────────────────────────────────────────────────────────────────────────┘
-                                 │
-                                 ▼
- ┌──────────────────────────────────────────────────────────────────────────────────────────┐
- │  Inference & Geospatial Delivery                                                         │
- │  ├── Predicted Chemical Class with Softmax Confidence Score                             │
- │  ├── Predicted Concentration (mg/L, ppm) with Monte Carlo 95% Confidence Interval (CI95) │
- │  └── REST API Engine -> Real-Time WebGIS Heatmap Mapping & Alert Dispatching             │
+ │  └── Task Head 3 (NO2- Quantification): Linear(d, 512) -> ReLU -> Dropout -> Linear(512, 2)
+ │      └── Predicted Concentration (mu) + Aleatoric Log-Variance (log_var)                 │
+ └──────────────────────────────────────────────────────────────────────────────│───────────┘
+                                                                                │
+ ┌──────────────────────────────────────────────────────────────────────────────▼───────────┐
+ │  3. REST API MICROSERVICE & GEOSPATIAL WEBGIS DELIVERY                                   │
+ │                                                                                          │
+ │  ├── FastAPI Cloud/Edge Inference Endpoint (`POST /predict`)                             │
+ │  ├── Analytical Quantification with Monte Carlo 95% Confidence Interval (CI95)           │
+ │  └── Real-Time GeoJSON Delivery -> WebGIS Interactive Heatmaps & Pollution Alerts        │
  └──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 🔬 Study Scope & Publication
-
-This repository hosts the canonical codebase, frozen experimental manifests, pre-trained model weights, and REST API deployment engine for the study:
+## 🔬 Research Article & Study Scope
 
 > **"A Smartphone-AI-WebGIS Platform for Real-Time Monitoring of Inorganic Nitrogen in Water"**  
 > *Trung Nguyen Quoc, Minh-Vuong Phan, Phuc Nguyen Tran Thien, Vinh Truong Hoang, Thi-Mai-Thy Pham, Thanh-Long Do, Thai-Binh Tran\*, Manh-Huy Do, Le-Kim-Thuy Nguyen, Thi-Kim-Dung Hoang, and Thanh-Danh Nguyen\**  
 > Corresponding Authors: *T.B. Tran* (`thaibinhtran@gmail.com`), *T.D. Nguyen* (`danh5463bd@yahoo.com`).
 
-### Key Analytical Contributions
-1. **Multi-Analyte Strip Colorimetry**: Simultaneous classification ($\text{NH}_4^+$ vs. $\text{NO}_2^-$) and continuous quantification from single smartphone captures.
-2. **Heteroscedastic Uncertainty Estimation**: Dual-output Gaussian negative log-likelihood modeling $(\mu, \log \sigma^2)$ yielding $95\%$ analytical confidence bounds.
-3. **Environmental Robustness**: Multi-domain evaluation over natural surface water and laboratory calibration matrices ($3\text{K}$, $10\text{K}$, and $13\text{K}$ datasets).
-4. **Cloud-Native WebGIS Integration**: Portable, zero-breaking-change REST microservice for real-time water quality mapping.
+### Scope of this Repository
+- **AI Core & Computer Vision**: Autonomous test strip segmentation (YOLOv8) and green-border color reference normalization.
+- **Deep Learning Modeling**: Multi-Task Heteroscedastic Neural Network with MLP2 task heads for simultaneous analyte classification ($\text{NH}_4^+$ vs. $\text{NO}_2^-$) and continuous concentration estimation with aleatoric uncertainty ($\mu, \sigma^2$).
+- **Reproducibility Suite**: Cryptographic frozen dataset manifests ($3\text{K}$, $10\text{K}$, and $13\text{K}$ splits), master configuration (`paper_v1.yaml`), evaluation benchmarks (matched, mismatch ablation, domain transfer), and automated test suites.
+- **REST API Microservice**: High-performance FastAPI server providing operational (`mode=app`) and strict reproduction (`mode=paper`) endpoints.
 
 ---
 
@@ -113,6 +115,7 @@ AI---Chemistry/
 │   ├── test_manifest_integrity.py      # Dataset partition verification
 │   ├── test_model_architecture.py      # Network head & dimension verification
 │   ├── test_greenborder_regression.py  # Color normalizer regression tests
+│   ├── test_checkpoint_load.py         # Strict checkpoint loading tests
 │   └── test_api_compatibility.py       # API backward-compatibility smoke tests
 └── weights/
     ├── README.md                       # Weight download links & instructions
@@ -247,9 +250,9 @@ python scripts/summarize_results.py --results_dir results
 
 ---
 
-## 🚀 REST API & WebGIS Service Deployment
+## 🚀 REST API Microservice Deployment
 
-The FastAPI application powers real-time inference for smartphone field clients and WebGIS integration.
+The FastAPI application powers real-time inference for smartphone clients and WebGIS integration.
 
 ### Quick Start
 ```bash
@@ -312,7 +315,7 @@ print(response.json())
 
 ## 🧪 Automated Unit Test Suite
 
-Run the full validation suite before deploying or archiving:
+Run the full validation suite:
 
 ```bash
 # Manifest count, schema & zero leakage test
@@ -323,6 +326,9 @@ python -m unittest tests/test_model_architecture.py
 
 # Color normalizer numerical regression test
 python -m unittest tests/test_greenborder_regression.py
+
+# Strict checkpoint loading test
+python -m unittest tests/test_checkpoint_load.py
 
 # API backward compatibility & alias resolution test
 python -m unittest tests/test_api_compatibility.py
