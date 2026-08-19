@@ -1,6 +1,6 @@
-﻿# Dataset Partitions & Manifest Integrity Documentation
+﻿# Dataset Partitions & Manifest Documentation
 
-This directory contains the frozen, cryptographic dataset manifests used across all experiments in the study:
+This directory contains the frozen dataset manifests used across all experiments in the study:
 
 > **"A Smartphone-AI-WebGIS Platform for Real-Time Monitoring of Inorganic Nitrogen in Water"**
 
@@ -35,13 +35,3 @@ path,chemical,ppm,device,datetime,split
 - `device`: Smartphone model used for acquisition.
 - `datetime`: Timestamp of capture.
 - `split`: Partition assignment (`train`, `val`, `test`).
-
----
-
-## 3. Automated Manifest Validation
-
-To verify the row counts, column schemas, and ensure **zero cross-split sample leakage**:
-
-```bash
-python tools/validate_publication_data.py --manifests_dir data/manifests
-```

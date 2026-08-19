@@ -2,7 +2,6 @@
 
 # AI-Chemistry: Multi-Task Deep Learning & REST API Engine for Inorganic Nitrogen Monitoring
 
-[![CI](https://github.com/ntthienphuc/AI---Chemistry/actions/workflows/ci.yml/badge.svg)](https://github.com/ntthienphuc/AI---Chemistry/actions/workflows/ci.yml)
 [![Protocol](https://img.shields.io/badge/Protocol-paper--v1.0-2ea44f?style=for-the-badge&logo=git)](https://github.com/ntthienphuc/AI---Chemistry/releases/tag/paper-v1.0)
 [![Python Version](https://img.shields.io/badge/Python-3.10%20%7C%203.11-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)](https://pytorch.org/)
@@ -66,7 +65,7 @@ This repository hosts the **core AI, computer vision pipeline, multi-task neural
 ### Scope of this Repository
 - **Computer Vision Pipeline**: Autonomous test strip segmentation using `YOLO11n-seg` and green-border color reference normalization in linear RGB space.
 - **Deep Learning Modeling**: Multi-Task Heteroscedastic Neural Network with MLP2 task heads for simultaneous analyte classification ($\text{NH}_4^+$ vs. $\text{NO}_2^-$) and continuous concentration estimation with aleatoric uncertainty ($\mu, \sigma^2$).
-- **Reproducibility Suite**: Cryptographic frozen dataset manifests ($3\text{K}$, $10\text{K}$, and $13\text{K}$ splits), master configuration (`paper_v1.yaml`), evaluation benchmarks (matched, mismatch ablation, domain transfer, source-resolved robustness), and automated unit tests.
+- **Reproducibility Suite**: Cryptographic frozen dataset manifests ($3\text{K}$, $10\text{K}$, and $13\text{K}$ splits), master configuration (`paper_v1.yaml`), and synchronized training/evaluation scripts.
 - **REST API Microservice**: High-performance FastAPI server providing operational (`mode=app`) and strict reproduction (`mode=paper`) endpoints.
 
 ---
@@ -81,7 +80,6 @@ AI---Chemistry/
 ├── requirements.txt                    # Core Python dependencies
 ├── requirements-lock.txt               # Pinned tested environment
 ├── environment.yml                     # Conda environment specification
-├── .github/workflows/ci.yml            # Automated CI build and test workflow
 ├── configs/
 │   └── paper_v1.yaml                   # Master publication experiment configuration
 ├── data/
@@ -108,25 +106,8 @@ AI---Chemistry/
 │   ├── roi.py                          # YOLO11n-seg autonomous ROI localization
 │   ├── calibration.py                  # API color normalization wrapper
 │   └── schemas.py                      # Pydantic request/response schemas
-├── scripts/
-│   ├── eval_matched.py                 # Matched preprocessing evaluation
-│   ├── eval_preprocessing_mismatch.py  # Intentional mismatch ablation study
-│   ├── eval_transfer.py                # Cross-dataset domain generalization (3K <-> 10K)
-│   ├── eval_source_resolved_13k.py     # Source-resolved 13K robustness (C3 & C4)
-│   ├── summarize_results.py            # Receipt aggregator & summary table generator
-│   └── run_paper_matrix.py             # Full experimental matrix automation
-├── tests/
-│   ├── test_manifest_integrity.py      # Dataset partition verification
-│   ├── test_model_architecture.py      # Network head & dimension verification
-│   ├── test_greenborder_regression.py  # Color normalizer regression tests
-│   ├── test_checkpoint_load.py         # Dynamic checkpoint loading tests
-│   └── test_api_compatibility.py       # API backward-compatibility smoke tests
-├── tools/
-│   ├── validate_publication_data.py    # Manifest integrity validation tool
-│   └── audit_all_checkpoints.py        # Comprehensive checkpoint auditor
 └── weights/
-    ├── README.md                       # Weight download links & instructions
-    └── checkpoints_manifest.csv        # Audited parameters & SHA-256 checksums
+    └── README.md                       # Weight download links & directory structure
 ```
 
 ---
@@ -140,13 +121,6 @@ All dataset partitions were **frozen prior to model evaluation** to guarantee ze
 | **3K** | Field / Natural Water Colorimetry | **2,841** | 2,064 | 476 | 301 | $0.00 - 5.00\text{ ppm}$ |
 | **10K** | Laboratory Matrix & Spiked Solutions | **9,922** | 7,227 | 1,795 | 900 | $0.00 - 22.00\text{ ppm}$ |
 | **13K** | Multi-Domain Combined Dataset | **10,491** | 7,495 | 2,095 | 901 | $0.00 - 22.00\text{ ppm}$ |
-
-### Automated Manifest Validation
-Verify row counts, label integrity, and zero cross-partition leakage:
-
-```bash
-python tools/validate_publication_data.py --manifests_dir data/manifests
-```
 
 Raw full-resolution colorimetric strip images are hosted on Google Drive:
 - **Download Images**: [Raw Image Archive](https://drive.google.com/drive/folders/12lvPMyir46usQyKULd2RU_uE_CvoVKkS?usp=sharing) (Extract to `data/raw/<dataset>/`).
@@ -192,9 +166,39 @@ Training employed two analyte-specific heteroscedastic regression heads together
 
 ---
 
-## 📈 Evaluation & Benchmark Reproduction
+## 📈 Training & Evaluation Reproduction
 
-### 1. Checkpoint Evaluation on Test Split
+### 1. Train a Multi-Task Model
+```bash
+python -m ai_chemistry.training.train_classifier \
+  --dataset 13k \
+  --timm_name mobilenetv3_large_100.ra_in1k \
+  --image_size 224 \
+  --epochs 60 \
+  --warmup_epochs 5 \
+  --lr 2e-4 \
+  --loss_weight_cls 1.0 \
+  --loss_weight_reg 2.0 \
+  --label_smoothing 0.05 \
+  --drop 0.2 \
+  --drop_path 0.1 \
+  --grad_clip 1.0 \
+  --patience 10 \
+  --seed 0 \
+  --calib_mode none \
+  --save_ckpt weights/runs_multitask_13k/MNV3_seed0_l2.0_none.pt
+```
+
+For green-border calibrated training:
+```bash
+python -m ai_chemistry.training.train_classifier \
+  --dataset 13k \
+  --timm_name mobilenetv3_large_100.ra_in1k \
+  --calib_mode greenborder \
+  --save_ckpt weights/runs_multitask_13k/MNV3_seed0_l2.0_green.pt
+```
+
+### 2. Evaluate a Checkpoint on Test Split
 ```bash
 python -m ai_chemistry.training.test_classifier \
   --ckpt_path weights/runs_multitask_10k/ConvNext_seed0_l2.0_none.pt \
@@ -203,31 +207,6 @@ python -m ai_chemistry.training.test_classifier \
   --calib auto \
   --output_json results/convnext10k_none_test.json \
   --predictions_csv results/convnext10k_none_test_predictions.csv
-```
-
-### 2. Matched Preprocessing Matrix
-```bash
-python scripts/eval_matched.py --dataset 10k --device cuda
-```
-
-### 3. Preprocessing Mismatch Ablation Study ($\text{None} \to \text{GreenBorder}$)
-```bash
-python scripts/eval_preprocessing_mismatch.py --dataset 10k --device cuda
-```
-
-### 4. Cross-Dataset Domain Generalization ($3\text{K} \leftrightarrow 10\text{K}$)
-```bash
-python scripts/eval_transfer.py --device cuda
-```
-
-### 5. Source-Resolved 13K Robustness Evaluation (C3 & C4 Components)
-```bash
-python scripts/eval_source_resolved_13k.py --device cuda
-```
-
-### 6. Aggregate Results Summary Table
-```bash
-python scripts/summarize_results.py --results_dir results
 ```
 
 ---
@@ -269,34 +248,6 @@ with open("sample_strip.jpg", "rb") as f:
     response = requests.post(url, params=params, files=files)
 
 print(response.json())
-```
-
----
-
-## 🧪 Automated Unit Test Suite & Verification
-
-Run the full validation suite locally:
-
-```bash
-# Manifest count, schema & zero leakage test
-python -m unittest tests/test_manifest_integrity.py
-
-# Model architecture & MLP2 task head test
-python -m unittest tests/test_model_architecture.py
-
-# Color normalizer numerical regression test
-python -m unittest tests/test_greenborder_regression.py
-
-# Dynamic checkpoint loading test
-python -m unittest tests/test_checkpoint_load.py
-
-# API backward compatibility & alias resolution test
-python -m unittest tests/test_api_compatibility.py
-```
-
-Audit all pre-trained checkpoints:
-```bash
-python tools/audit_all_checkpoints.py --weights_dir weights
 ```
 
 ---

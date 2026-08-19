@@ -1,4 +1,4 @@
-﻿# Pre-Trained Model Weights & Checkpoints Manifest
+﻿# Pre-Trained Model Weights & Directory Structure
 
 This directory documents the pre-trained model checkpoints for all vision backbones across the 3K, 10K, and 13K datasets under both uncalibrated (`none`) and green-border calibrated (`greenborder` / `green`) conditions.
 
@@ -14,7 +14,6 @@ After downloading, place the files following this exact hierarchy:
 ```text
 weights/
 ├── best.pt                          (YOLO11n-seg autonomous strip ROI detector)
-├── checkpoints_manifest.csv         (Cryptographic SHA-256 manifest & architecture audit)
 ├── runs_multitask_3k/
 │   ├── <Backbone>_seed0_l2.0_<calib>.pt
 │   └── <Backbone>_seed0_l2.0_<calib>.meta.json
@@ -26,36 +25,35 @@ weights/
     └── <Backbone>_seed0_l2.0_<calib>.meta.json
 ```
 
----
-
-## 2. Checkpoint Architecture & Checksum Audit
-
-All 36 published multi-task checkpoints and the `YOLO11n-seg` detector have been independently audited with `tools/audit_all_checkpoints.py`:
-
-| Checkpoint File | Backbone Identifier (`timm_name`) | Head Variant | Head Input Dim ($d$) | Total Parameters | SHA-256 (Prefix) |
-| :--- | :--- | :---: | :---: | :---: | :--- |
-| `best.pt` | `yolo11n-seg` | Seg Head | N/A | 2.60 M | `656601dfcc10...` |
-| `runs_multitask_13k/MNV3_seed0_l2.0_none.pt` | `mobilenetv3_large_100.ra_in1k` | `mlp2` | 1280 | 6.20 M | `b32a9c5b9f69...` |
-| `runs_multitask_13k/MNV3_seed0_l2.0_green.pt` | `mobilenetv3_large_100.ra_in1k` | `mlp2` | 1280 | 6.20 M | `834dc3d59b70...` |
-| `runs_multitask_13k/EffB0_seed0_l2.0_none.pt` | `efficientnet_b0.ra_in1k` | `mlp2` | 1280 | 6.02 M | `e3d83d93c45d...` |
-| `runs_multitask_13k/EffB0_seed0_l2.0_green.pt` | `efficientnet_b0.ra_in1k` | `mlp2` | 1280 | 6.02 M | `35a39a95ff2c...` |
-| `runs_multitask_13k/SwinT_seed0_l2.0_none.pt` | `swin_tiny_patch4_window7_224.ms_in1k` | `mlp2` | 768 | 28.70 M | `8c196f45e730...` |
-| `runs_multitask_13k/SwinT_seed0_l2.0_green.pt` | `swin_tiny_patch4_window7_224.ms_in1k` | `mlp2` | 768 | 28.70 M | `9573f1448bec...` |
-| `runs_multitask_13k/TFB3_seed0_l2.0_none.pt` | `tf_efficientnet_b3.ns_jft_in1k` | `mlp2` | 1536 | 13.15 M | `b86561b24ea3...` |
-| `runs_multitask_13k/TFB3_seed0_l2.0_green.pt` | `tf_efficientnet_b3.ns_jft_in1k` | `mlp2` | 1536 | 13.15 M | `06b35c16c464...` |
-| `runs_multitask_13k/ConvNext_seed0_l2.0_none.pt` | `convnext_tiny.fb_in1k` | `mlp2` | 768 | 29.00 M | `9032c3fa2f87...` |
-| `runs_multitask_13k/ConvNext_seed0_l2.0_green.pt` | `convnext_tiny.fb_in1k` | `mlp2` | 768 | 29.00 M | `b3c529ba5920...` |
-| `runs_multitask_13k/NFNet_seed0_l2.0_none.pt` | `dm_nfnet_f2.dm_in1k` | `mlp2` | 3072 | 195.43 M | `6417b98255c0...` |
-| `runs_multitask_13k/NFNet_seed0_l2.0_green.pt` | `dm_nfnet_f2.dm_in1k` | `mlp2` | 3072 | 195.43 M | `e79438909d62...` |
-
-*(See `checkpoints_manifest.csv` for the full audited list of all 37 checkpoint files).*
+Where `<Backbone>` $\in$ `{ConvNext, EffB0, MNV3, NFNet, SwinT, TFB3}` and `<calib>` $\in$ `{none, green}`.
 
 ---
 
-## 3. Automated Checkpoint Audit Tool
+## 2. Checkpoint Loading Example
 
-To audit local checkpoints and re-verify strict loadability:
+All published multi-task checkpoints load directly into `MultiTaskHeteroFlexible`:
 
-```bash
-python tools/audit_all_checkpoints.py --weights_dir weights --output_csv weights/checkpoints_manifest.csv
+```python
+import torch
+from ai_chemistry.modeling import MultiTaskHeteroFlexible, build_meta_from_ckpt, strip_state_dict_prefix, infer_head_variant, infer_reg_out_dim, infer_head_in_features
+
+ckpt_path = "weights/runs_multitask_13k/MNV3_seed0_l2.0_none.pt"
+ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+state = strip_state_dict_prefix(ckpt.get("state_dict", ckpt))
+meta = build_meta_from_ckpt(ckpt, ckpt_path=ckpt_path)
+
+model = MultiTaskHeteroFlexible(
+    timm_name=meta.timm_name,
+    num_classes=meta.num_classes,
+    pretrained=False,
+    drop=meta.drop,
+    drop_path=meta.drop_path,
+    image_size=meta.image_size,
+    head_variant=infer_head_variant(state),
+    reg_out_dim=infer_reg_out_dim(state),
+    expected_feat_dim=infer_head_in_features(state),
+)
+model.load_state_dict(state, strict=True)
+model.eval()
+print(f"Loaded {meta.timm_name} successfully with strict=True!")
 ```
