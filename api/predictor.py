@@ -38,7 +38,8 @@ class Prediction:
 class LoadedPredictor:
     """
     Inference wrapper for multi-task heteroscedastic strip colorimetry models.
-    Supports uncertainty quantification via Monte Carlo sampling from predicted (mu, log_var).
+    Provides predicted analyte class, expected concentration (ppm), and
+    an optional approximate 95% predictive interval derived from the heteroscedastic log-variance.
     """
 
     def __init__(self, ckpt_path: Path, meta_path: Optional[Path], device: str, calib_mode: str):
@@ -47,7 +48,7 @@ class LoadedPredictor:
         self.device = self._resolve_device(device)
         self.calib_mode = calib_mode
 
-        ckpt = torch.load(str(self.ckpt_path), map_location="cpu")
+        ckpt = torch.load(str(self.ckpt_path), map_location="cpu", weights_only=False)
         state = ckpt.get("state_dict", ckpt)
         if not isinstance(state, dict):
             raise RuntimeError(f"Invalid state dict in checkpoint: {self.ckpt_path}")
@@ -118,7 +119,7 @@ class LoadedPredictor:
         return torch.device("cpu")
 
     @torch.inference_mode()
-    def predict(self, roi_bgr: np.ndarray, mc_samples: int = 200) -> Prediction:
+    def predict(self, roi_bgr: np.ndarray, mc_samples: int = 200, deterministic: bool = True) -> Prediction:
         # 1. Color Calibration
         rgb01 = self.normalizer(roi_bgr)
 
@@ -152,21 +153,35 @@ class LoadedPredictor:
 
         if logvar_s is not None:
             sigma_s = float(np.exp(0.5 * logvar_s))
-            z = np.random.randn(int(mc_samples)).astype(np.float32)
-            samples_s = mu_s + sigma_s * z
-            samples_ppm = np.array(
-                [
-                    inverse_scale_ppm(float(v), self.meta.ppm_scale, self.meta.ppm_min, self.meta.ppm_max)
-                    for v in samples_s
-                ],
-                dtype=np.float32,
-            )
-            samples_ppm = np.clip(samples_ppm, 0.0, np.inf)
-
-            lo = float(np.quantile(samples_ppm, 0.025))
-            hi = float(np.quantile(samples_ppm, 0.975))
-            ppm_ci = (lo, hi)
-            ppm_sigma = float(samples_ppm.std())
+            if deterministic:
+                # Exact analytical 95% interval in scaled Gaussian space (z = 1.95996)
+                z95 = 1.959963984540054
+                lo_s = mu_s - z95 * sigma_s
+                hi_s = mu_s + z95 * sigma_s
+                lo_ppm = max(0.0, float(inverse_scale_ppm(lo_s, self.meta.ppm_scale, self.meta.ppm_min, self.meta.ppm_max)))
+                hi_ppm = max(0.0, float(inverse_scale_ppm(hi_s, self.meta.ppm_scale, self.meta.ppm_min, self.meta.ppm_max)))
+                ppm_ci = (min(lo_ppm, hi_ppm), max(lo_ppm, hi_ppm))
+                # Approximate delta-method standard deviation in original ppm space
+                if self.meta.ppm_scale == "log1p":
+                    ppm_sigma = float(sigma_s * math.exp(mu_s))
+                else:
+                    ppm_sigma = float(sigma_s)
+            else:
+                rng = np.random.RandomState(0)
+                z = rng.randn(int(mc_samples)).astype(np.float32)
+                samples_s = mu_s + sigma_s * z
+                samples_ppm = np.array(
+                    [
+                        inverse_scale_ppm(float(v), self.meta.ppm_scale, self.meta.ppm_min, self.meta.ppm_max)
+                        for v in samples_s
+                    ],
+                    dtype=np.float32,
+                )
+                samples_ppm = np.clip(samples_ppm, 0.0, np.inf)
+                lo = float(np.quantile(samples_ppm, 0.025))
+                hi = float(np.quantile(samples_ppm, 0.975))
+                ppm_ci = (lo, hi)
+                ppm_sigma = float(samples_ppm.std())
 
         raw = {
             "probs": probs.tolist(),

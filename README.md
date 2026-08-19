@@ -2,7 +2,8 @@
 
 # AI-Chemistry: Multi-Task Deep Learning & REST API Engine for Inorganic Nitrogen Monitoring
 
-[![Paper Version](https://img.shields.io/badge/Protocol-paper--v1.0-2ea44f?style=for-the-badge&logo=git)](https://github.com/ntthienphuc/AI---Chemistry/releases/tag/paper-v1.0)
+[![CI](https://github.com/ntthienphuc/AI---Chemistry/actions/workflows/ci.yml/badge.svg)](https://github.com/ntthienphuc/AI---Chemistry/actions/workflows/ci.yml)
+[![Protocol](https://img.shields.io/badge/Protocol-paper--v1.0-2ea44f?style=for-the-badge&logo=git)](https://github.com/ntthienphuc/AI---Chemistry/releases/tag/paper-v1.0)
 [![Python Version](https://img.shields.io/badge/Python-3.10%20%7C%203.11-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
@@ -24,9 +25,10 @@ This repository hosts the **core AI, computer vision pipeline, multi-task neural
  │  1. ON-SITE DATA ACQUISITION & LOCALIZATION                                              │
  │                                                                                          │
  │   ┌────────────────────────┐       ┌────────────────────────┐       ┌──────────────────┐ │
- │   │   Smartphone Camera    │  ───► │  YOLOv8n-Seg Detection │  ───► │ Green-Border     │ │
- │   │ (Ambient Illumination) │       │ (Autonomous Strip ROI) │       │ Color Normalizer │ │
- │   └────────────────────────┘       └────────────────────────┘       └──────────────────┘ │
+ │   │   Smartphone Imaging   │  ───► │  YOLO11n-seg Detection │  ───► │ Green-Border     │ │
+ │   │ (Standardized Enclosure│       │ (Autonomous Strip ROI) │       │ Color Normalizer │ │
+ │   │  + Fixed White LED)    │       └────────────────────────┘       └──────────────────┘ │
+ │   └────────────────────────┘                                                 │           │
  └──────────────────────────────────────────────────────────────────────────────│───────────┘
                                                                                 │ (Linear RGB)
  ┌──────────────────────────────────────────────────────────────────────────────▼───────────┐
@@ -48,7 +50,7 @@ This repository hosts the **core AI, computer vision pipeline, multi-task neural
  │  3. REST API MICROSERVICE & GEOSPATIAL WEBGIS DELIVERY                                   │
  │                                                                                          │
  │  ├── FastAPI Cloud/Edge Inference Endpoint (`POST /predict`)                             │
- │  ├── Analytical Quantification with Monte Carlo 95% Confidence Interval (CI95)           │
+ │  ├── Analytical Quantification with Optional Approximate 95% Predictive Interval         │
  │  └── Real-Time GeoJSON Delivery -> WebGIS Interactive Heatmaps & Pollution Alerts        │
  └──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -62,9 +64,9 @@ This repository hosts the **core AI, computer vision pipeline, multi-task neural
 > Corresponding Authors: *T.B. Tran* (`thaibinhtran@gmail.com`), *T.D. Nguyen* (`danh5463bd@yahoo.com`).
 
 ### Scope of this Repository
-- **AI Core & Computer Vision**: Autonomous test strip segmentation (YOLOv8) and green-border color reference normalization.
+- **Computer Vision Pipeline**: Autonomous test strip segmentation using `YOLO11n-seg` and green-border color reference normalization in linear RGB space.
 - **Deep Learning Modeling**: Multi-Task Heteroscedastic Neural Network with MLP2 task heads for simultaneous analyte classification ($\text{NH}_4^+$ vs. $\text{NO}_2^-$) and continuous concentration estimation with aleatoric uncertainty ($\mu, \sigma^2$).
-- **Reproducibility Suite**: Cryptographic frozen dataset manifests ($3\text{K}$, $10\text{K}$, and $13\text{K}$ splits), master configuration (`paper_v1.yaml`), evaluation benchmarks (matched, mismatch ablation, domain transfer), and automated test suites.
+- **Reproducibility Suite**: Cryptographic frozen dataset manifests ($3\text{K}$, $10\text{K}$, and $13\text{K}$ splits), master configuration (`paper_v1.yaml`), evaluation benchmarks (matched, mismatch ablation, domain transfer, source-resolved robustness), and automated unit tests.
 - **REST API Microservice**: High-performance FastAPI server providing operational (`mode=app`) and strict reproduction (`mode=paper`) endpoints.
 
 ---
@@ -79,6 +81,7 @@ AI---Chemistry/
 ├── requirements.txt                    # Core Python dependencies
 ├── requirements-lock.txt               # Pinned tested environment
 ├── environment.yml                     # Conda environment specification
+├── .github/workflows/ci.yml            # Automated CI build and test workflow
 ├── configs/
 │   └── paper_v1.yaml                   # Master publication experiment configuration
 ├── data/
@@ -101,38 +104,42 @@ AI---Chemistry/
 ├── api/
 │   ├── main.py                         # FastAPI application entrypoint
 │   ├── config.py                       # Model zoo registry & environment paths
-│   ├── predictor.py                    # Inference engine with MC uncertainty
-│   ├── roi.py                          # YOLOv8 autonomous ROI localization
+│   ├── predictor.py                    # Inference engine with MC/analytic intervals
+│   ├── roi.py                          # YOLO11n-seg autonomous ROI localization
 │   ├── calibration.py                  # API color normalization wrapper
 │   └── schemas.py                      # Pydantic request/response schemas
 ├── scripts/
 │   ├── eval_matched.py                 # Matched preprocessing evaluation
 │   ├── eval_preprocessing_mismatch.py  # Intentional mismatch ablation study
-│   ├── eval_transfer.py                # Cross-dataset domain generalization
+│   ├── eval_transfer.py                # Cross-dataset domain generalization (3K <-> 10K)
+│   ├── eval_source_resolved_13k.py     # Source-resolved 13K robustness (C3 & C4)
 │   ├── summarize_results.py            # Receipt aggregator & summary table generator
 │   └── run_paper_matrix.py             # Full experimental matrix automation
 ├── tests/
 │   ├── test_manifest_integrity.py      # Dataset partition verification
 │   ├── test_model_architecture.py      # Network head & dimension verification
 │   ├── test_greenborder_regression.py  # Color normalizer regression tests
-│   ├── test_checkpoint_load.py         # Strict checkpoint loading tests
+│   ├── test_checkpoint_load.py         # Dynamic checkpoint loading tests
 │   └── test_api_compatibility.py       # API backward-compatibility smoke tests
+├── tools/
+│   ├── validate_publication_data.py    # Manifest integrity validation tool
+│   └── audit_all_checkpoints.py        # Comprehensive checkpoint auditor
 └── weights/
     ├── README.md                       # Weight download links & instructions
-    └── checkpoints_manifest.csv        # SHA-256 checksums of 36 model checkpoints
+    └── checkpoints_manifest.csv        # Audited parameters & SHA-256 checksums
 ```
 
 ---
 
 ## 📊 Dataset Partitioning & Frozen Manifests
 
-All experiments are conducted on deterministic, frozen partitions without data leakage:
+All dataset partitions were **frozen prior to model evaluation** to guarantee zero data leakage across splits:
 
 | Dataset ID | Target Domain | Total Samples | Train Split | Validation Split | Test Split | Concentration Range |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: |
-| **3K** | Field / Natural Water Colorimetry | **2,841** | 2,064 | 476 | 301 | $0.0 - 5.0\text{ ppm}$ |
-| **10K** | Laboratory Colorimetric Matrix | **9,922** | 7,227 | 1,795 | 900 | $0.0 - 5.0\text{ ppm}$ |
-| **13K** | Multi-Domain Combined Set | **10,491** | 7,495 | 2,095 | 901 | Multi-device / Multi-condition |
+| **3K** | Field / Natural Water Colorimetry | **2,841** | 2,064 | 476 | 301 | $0.00 - 5.00\text{ ppm}$ |
+| **10K** | Laboratory Matrix & Spiked Solutions | **9,922** | 7,227 | 1,795 | 900 | $0.00 - 22.00\text{ ppm}$ |
+| **13K** | Multi-Domain Combined Dataset | **10,491** | 7,495 | 2,095 | 901 | $0.00 - 22.00\text{ ppm}$ |
 
 ### Automated Manifest Validation
 Verify row counts, label integrity, and zero cross-partition leakage:
@@ -146,19 +153,19 @@ Raw full-resolution colorimetric strip images are hosted on Google Drive:
 
 ---
 
-## 🧠 Neural Network Architectures & Exact Backbones
+## 🧠 Neural Network Architectures & Vision Backbones
 
 All multi-task models share the canonical **MLP2** task head topology:
 $$\text{Head}(x) = \text{Linear}(d, 512) \to \text{ReLU} \to \text{Dropout}(0.3) \to \text{Linear}(512, \text{out\_dim})$$
 
-| Model ID | Vision Backbone (`timm` Identifier) | Parameters | Pre-logits Dim ($d$) | Default Resolution |
-| :--- | :--- | :---: | :---: | :---: |
-| `mnv3` | `mobilenetv3_large_100.ra_in1k` | 5.4 M | 960 | $224 \times 224$ |
-| `effb0` | `efficientnet_b0.ra_in1k` | 5.3 M | 1,280 | $224 \times 224$ |
-| `nfnet` | `dm_nfnet_f2.dm_in1k` | 193.8 M | 3,072 | $224 \times 224$ |
-| `tfb3` | `tf_efficientnet_b3.ns_jft_in1k` | 12.0 M | 1,536 | $224 \times 224$ |
-| `convnext` | `convnext_tiny.fb_in1k` | 28.6 M | 768 | $224 \times 224$ |
-| `swint` | `swin_tiny_patch4_window7_224.ms_in1k` | 28.3 M | 768 | $224 \times 224$ |
+| Model ID | Vision Backbone (`timm` Identifier) | Backbone Params | Head Input Dim ($d$) | Total Model Params | Default Resolution |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| `mnv3` | `mobilenetv3_large_100.ra_in1k` | 5.4 M | **1280** | **6.20 M** | $224 \times 224$ |
+| `effb0` | `efficientnet_b0.ra_in1k` | 5.3 M | **1280** | **6.02 M** | $224 \times 224$ |
+| `nfnet` | `dm_nfnet_f2.dm_in1k` / `dm_nfnet_f0.dm_in1k` | 193.8 M / 71.5 M | **3072** | **195.43 M / 73.14 M** | $224 \times 224$ |
+| `tfb3` | `tf_efficientnet_b3.ns_jft_in1k` | 12.0 M | **1536** | **13.15 M** | $224 \times 224$ |
+| `convnext` | `convnext_tiny.fb_in1k` / `convnext_base.fb_in1k` | 28.6 M / 88.6 M | **768 / 1024** | **29.00 M / 89.14 M** | $224 \times 224$ |
+| `swint` | `swin_tiny_patch4_window7_224.ms_in1k` | 28.3 M | **768** | **28.70 M** | $224 \times 224$ |
 
 ### Loss Formulation
 Multi-task loss with heteroscedastic aleatoric uncertainty:
@@ -204,15 +211,6 @@ python -m ai_chemistry.training.train_classifier \
   --save_ckpt weights/runs_multitask_13k/MNV3_seed0_l2.0_none.pt
 ```
 
-For green-border calibrated training:
-```bash
-python -m ai_chemistry.training.train_classifier \
-  --dataset 13k \
-  --timm_name mobilenetv3_large_100.ra_in1k \
-  --calib_mode greenborder \
-  --save_ckpt weights/runs_multitask_13k/MNV3_seed0_l2.0_green.pt
-```
-
 ---
 
 ## 📈 Evaluation & Benchmark Reproduction
@@ -243,7 +241,12 @@ python scripts/eval_preprocessing_mismatch.py --dataset 10k --device cuda
 python scripts/eval_transfer.py --device cuda
 ```
 
-### 5. Aggregate Results Summary Table
+### 5. Source-Resolved 13K Robustness Evaluation (C3 & C4 Components)
+```bash
+python scripts/eval_source_resolved_13k.py --device cuda
+```
+
+### 6. Aggregate Results Summary Table
 ```bash
 python scripts/summarize_results.py --results_dir results
 ```
@@ -264,14 +267,14 @@ Interactive Swagger UI: `http://localhost:8000/docs`
 ### API Endpoints
 - `GET /health` : Service health status.
 - `GET /models` : List registered model keys, aliases, and runtime configurations.
-- `POST /predict` : Multi-task classification and concentration prediction with 95% confidence bounds.
+- `POST /predict` : Multi-task classification and concentration prediction with optional 95% predictive interval.
 
 ### Prediction Modes
 | Mode | Behavior | Description |
 | :--- | :--- | :--- |
 | `mode=app` *(Default)* | Flexible ROI (`roi_mode=auto`), green/center fallback, calib override | Backward-compatible operational path |
-| `mode=paper` | Strict YOLO ROI (10% pad), fallback disabled, matched calib enforced | Deterministic publication reproduction |
-| `mode=diagnostic` | Strict YOLO ROI, intentional calib mismatch allowed | Ablation & mismatch experiments |
+| `mode=paper` | Strict YOLO11n-seg ROI (10% pad), fallback disabled, matched calib enforced | Deterministic publication reproduction |
+| `mode=diagnostic` | Strict YOLO11n-seg ROI, intentional calib mismatch allowed | Ablation & mismatch experiments |
 
 ### Python Client Example
 ```python
@@ -289,33 +292,11 @@ with open("sample_strip.jpg", "rb") as f:
 print(response.json())
 ```
 
-### Example JSON Response
-```json
-{
-  "model": "convnext10k_none",
-  "predicted_chemical": "NH4",
-  "chemical_confidence": 0.9984,
-  "concentration": {
-    "ppm": 1.482,
-    "ppm_ci95": [1.321, 1.654],
-    "ppm_sigma": 0.085
-  },
-  "calib_mode": "none",
-  "roi": {
-    "source": "yolo",
-    "bbox_xyxy": [142, 85, 398, 412],
-    "padding": 0.1,
-    "imgsz": 640
-  },
-  "raw": null
-}
-```
-
 ---
 
-## 🧪 Automated Unit Test Suite
+## 🧪 Automated Unit Test Suite & Verification
 
-Run the full validation suite:
+Run the full validation suite locally:
 
 ```bash
 # Manifest count, schema & zero leakage test
@@ -327,11 +308,16 @@ python -m unittest tests/test_model_architecture.py
 # Color normalizer numerical regression test
 python -m unittest tests/test_greenborder_regression.py
 
-# Strict checkpoint loading test
+# Dynamic checkpoint loading test
 python -m unittest tests/test_checkpoint_load.py
 
 # API backward compatibility & alias resolution test
 python -m unittest tests/test_api_compatibility.py
+```
+
+Audit all pre-trained checkpoints:
+```bash
+python tools/audit_all_checkpoints.py --weights_dir weights
 ```
 
 ---

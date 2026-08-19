@@ -15,21 +15,29 @@ class TestGreenBorderRegression(unittest.TestCase):
         self.assertAlmostEqual(float(rgb[0, 0, 2]), 1.0, places=5)
         self.assertAlmostEqual(float(rgb[0, 0, 0]), 0.0, places=5)
 
-    def test_greenborder_numerical_stability(self):
+    def test_greenborder_numerical_constancy(self):
         norm = GreenBorderNormalizer()
-        # Create synthetic image with a green border
-        img = np.zeros((200, 200, 3), dtype=np.uint8)
-        # BGR: Green is (0, 200, 0)
-        img[:20, :] = [0, 200, 0]
-        img[-20:, :] = [0, 200, 0]
-        img[:, :20] = [0, 200, 0]
-        img[:, -20:] = [0, 200, 0]
-        # Center patch
-        img[50:150, 50:150] = [100, 100, 200]
+        # Create deterministic synthetic pattern with green reference border
+        np.random.seed(42)
+        img = np.zeros((120, 120, 3), dtype=np.uint8)
+        # Green border (BGR: 20, 210, 30)
+        img[:15, :] = [20, 210, 30]
+        img[-15:, :] = [20, 210, 30]
+        img[:, :15] = [20, 210, 30]
+        img[:, -15:] = [20, 210, 30]
+        # Inner color patch (BGR: 50, 100, 200)
+        img[30:90, 30:90] = [50, 100, 200]
 
         out = norm(img)
-        self.assertEqual(out.shape, (200, 200, 3))
+        self.assertEqual(out.shape, (120, 120, 3))
+        self.assertEqual(out.dtype, np.float32)
         self.assertTrue(np.all(out >= 0.0) and np.all(out <= 1.0))
+
+        # Check exact numerical output at known coordinates (center patch)
+        center_rgb = out[60, 60]
+        self.assertAlmostEqual(float(center_rgb[0]), 0.9999999, delta=0.05)
+        self.assertAlmostEqual(float(center_rgb[1]), 0.4819786, delta=0.05)
+        self.assertAlmostEqual(float(center_rgb[2]), 0.8197855, delta=0.05)
 
     def test_srgb_linear_roundtrip(self):
         x = np.linspace(0.0, 1.0, 100).astype(np.float32)
